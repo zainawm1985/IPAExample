@@ -18,6 +18,7 @@
 // 这里直接用runtime等价实现，也可以用MSHookMessageEx宏
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include <dlfcn.h>
 
 // 声明MSHookMessageEx，链接时会从CydiaSubstrate.framework找
 // 不依赖CydiaSubstrate也可以直接用method_setImplementation替换
@@ -294,7 +295,11 @@ static void MyTweakEntry(void) {
                 Class vcCls = [UIViewController class];
                 SEL vdaSel = @selector(viewDidAppear:);
                 IMP newVDA = imp_implementationWithBlock(^(id _self, BOOL animated){
-                    ((void(*)(id,SEL,BOOL))Orig_VC_viewDidAppear ? Orig_VC_viewDidAppear : (void*)objc_msgSend)(_self, @selector(viewDidAppear:), animated);
+                    if (Orig_VC_viewDidAppear) {
+                        Orig_VC_viewDidAppear(_self, @selector(viewDidAppear:), animated);
+                    } else {
+                        ((void(*)(id,SEL,BOOL))objc_msgSend)(_self, @selector(viewDidAppear:), animated);
+                    }
                     static dispatch_once_t once;
                     dispatch_once(&once, ^{
                         UIViewController *top = _self;
