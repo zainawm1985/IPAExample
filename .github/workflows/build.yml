@@ -178,10 +178,9 @@ jobs:
           6. 安装完成后在TrollStore里就能看到注入好的App了
           7. 打开App → 双击屏幕 → 弹出"[MyTweak]已激活"表示成功
           EOF
-          cd build && zip -r ../${{ env.TWEAK_NAME }}_dylib_注入包_$(date +%Y%m%d_%H%M%S).zip injection_package
-
-          # 额外做一个单文件zip (Sideloadly直接拖)
-          cd build && zip -j ../${{ env.TWEAK_NAME }}_fakesigned_onlydylib_$(date +%Y%m%d_%H%M%S).zip *.dylib
+          STAMP=$(date +%Y%m%d_%H%M%S)
+          (cd build && zip -r "../${{ env.TWEAK_NAME }}_dylib_注入包_${STAMP}.zip" injection_package)
+          (cd build && zip -j "../${{ env.TWEAK_NAME }}_fakesigned_onlydylib_${STAMP}.zip" *.dylib)
 
           # 记录版本信息 (方便查看)
           echo "RUN_ID=$GITHUB_RUN_ID"   >  build/version_info.txt
