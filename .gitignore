@@ -1,0 +1,37 @@
+# Build outputs
+build/
+Build/
+DerivedData/
+*.o
+*.ipa
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xcuserstate
+project.xcworkspace
+xcuserdata
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Workflow temp
+tmp_*/
+tmp_unz/
+tmp_out/
+analyze_dylib.pyc
+__pycache__/
+
+# IPA
+*.ipa
+!target.ipa   # 如果你想把target.ipa提交上去启用自动注入，就注释掉上面一行
+
+# Sideloadly
+.sideloadly/

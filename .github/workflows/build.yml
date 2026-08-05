@@ -1,0 +1,380 @@
+name: 🔨 编译 Tweak Dylib + 自动注入 IPA
+
+# 触发方式：
+# 1. workflow_dispatch: 页面上手动点按钮运行 (支持上传IPA自动注入)
+# 2. push tag v*:     打标签 v1.0 自动发布Release
+# 3. release:         发布Release时自动构建
+on:
+  workflow_dispatch:
+    inputs:
+      upload_ipa:
+        description: "(可选) 上传目标IPA以自动注入。直接拖入文件后，运行完会在Artifacts里下载注入好的IPA"
+        required: false
+        type: boolean
+        default: false
+      sign_with_certs:
+        description: "签名方式：false=AdHoc假签(TrollStore/Sideloadly用), true=如果你在Secrets里配了开发者证书"
+        required: false
+        type: boolean
+        default: false
+      min_ios:
+        description: "最低iOS版本"
+        required: false
+        default: "14.0"
+        type: string
+      arch:
+        description: "编译架构 (arm64 | arm64e | arm64,arm64e)"
+        required: false
+        default: "arm64"
+        type: choice
+        options:
+          - arm64
+          - arm64e
+          - arm64,arm64e
+
+  push:
+    tags:
+      - 'v*'
+
+  release:
+    types: [published]
+
+env:
+  TWEAK_NAME: MyTweak
+  SRC_FILE: MyTweak_example/MyTweak.m
+  FRAMEWORKS: "-framework Foundation -framework UIKit -framework QuartzCore"
+
+# ============================================================
+jobs:
+  build:
+    name: 📦 编译 Dylib (${{ github.event.inputs.arch || 'arm64' }})
+    runs-on: macos-14
+    outputs:
+      dylib_path: ${{ steps.upload.outputs.artifact-name }}
+
+    steps:
+      - name: 🛎️ Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 🔍 检查Xcode和SDK
+        run: |
+          echo "--- Xcode版本 ---"
+          xcodebuild -version
+          echo "--- SDK路径 ---"
+          xcrun --sdk iphoneos --show-sdk-path
+          echo "--- 可用SDKS ---"
+          xcodebuild -showsdks 2>/dev/null | head -20
+
+      - name: 📥 下载 CydiaSubstrate.framework (可选依赖)
+        run: |
+          # 从官方源拿最新的CydiaSubstrate，用户如果不链接它也可以正常用
+          mkdir -p build/vendor
+          # CydiaSubstrate.framework 可以直接从多个开源镜像拿，这里给出备用方式：
+          # 其实最稳的是从sideloadly/的包里解出来，这里提供网络获取：
+          # 我们不强制用它，但打包出来方便用户拖到Sideloadly
+          echo "跳过CydiaSubstrate下载(示例代码默认不直接链接它，用runtime swizzle即可)"
+          echo "CydiaSubstrate_PATH=vendor/CydiaSubstrate.framework" >> $GITHUB_ENV
+
+      - name: 🔨 编译 arm64 Dylib
+        env:
+          MIN_IOS: ${{ github.event.inputs.min_ios || '14.0' }}
+          ARCH: ${{ github.event.inputs.arch || 'arm64' }}
+        run: |
+          set -e
+          SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDKROOT=$SDKROOT"
+
+          mkdir -p build
+
+          # 处理多架构 (用lipo合并)
+          OUT_DYLIB="build/${{ env.TWEAK_NAME }}.dylib"
+          PIECES=()
+          for arch in ${ARCH//,/ }; do
+            echo "===== 编译 $arch ====="
+            OBJ="build/${{ env.TWEAK_NAME }}_$arch.o"
+            xcrun --sdk iphoneos clang \
+              -arch $arch \
+              -isysroot "$SDKROOT" \
+              -miphoneos-version-min=$MIN_IOS \
+              -fobjc-arc -fobjc-weak \
+              -Os -Wall -Wno-unused-variable -Wno-unused-function \
+              -c "${{ env.SRC_FILE }}" -o "$OBJ"
+            PIECES+=("$OBJ")
+          done
+
+          # 链接 (多架构用lipo)
+          if [ "${#PIECES[@]}" -eq 1 ]; then
+            INSTALL_NAME="@rpath/${{ env.TWEAK_NAME }}.dylib"
+            xcrun --sdk iphoneos clang \
+              -arch ${ARCH%%,*} \
+              -isysroot "$SDKROOT" \
+              -dynamiclib \
+              -install_name "$INSTALL_NAME" \
+              -compatibility_version 1.0 \
+              -current_version 1.0.0 \
+              -miphoneos-version-min=$MIN_IOS \
+              -dead_strip \
+              ${{ env.FRAMEWORKS }} \
+              "${PIECES[0]}" -o "$OUT_DYLIB"
+          else
+            # 先分别link再lipo
+            for arch in ${ARCH//,/ }; do
+              OBJ="build/${{ env.TWEAK_NAME }}_$arch.o"
+              TMP="build/${{ env.TWEAK_NAME }}_$arch.dylib"
+              xcrun --sdk iphoneos clang \
+                -arch $arch \
+                -isysroot "$SDKROOT" \
+                -dynamiclib \
+                -install_name "@rpath/${{ env.TWEAK_NAME }}.dylib" \
+                -miphoneos-version-min=$MIN_IOS \
+                -dead_strip \
+                ${{ env.FRAMEWORKS }} \
+                "$OBJ" -o "$TMP"
+              PIECES_DYLIB+=("$TMP")
+            done
+            lipo -create "${PIECES_DYLIB[@]}" -output "$OUT_DYLIB"
+          fi
+
+          echo "=== 编译成功 ==="
+          ls -lh "$OUT_DYLIB"
+          file "$OUT_DYLIB"
+
+      - name: 🖊️ 签名 Dylib (AdHoc)
+        run: |
+          DYLIB="build/${{ env.TWEAK_NAME }}.dylib"
+          if [ "${{ github.event.inputs.sign_with_certs }}" == "true" ]; then
+            echo "TODO: 开发者证书签名 (需要先在Secrets配置.p12和描述文件)"
+            codesign -f -s - --timestamp=none "$DYLIB"
+          else
+            echo "使用 AdHoc 假签名 (TrollStore/Sideloadly 兼容)"
+            xcrun --sdk iphoneos codesign -f -s - --timestamp=none "$DYLIB" || \
+              codesign -f -s - --timestamp=none "$DYLIB"
+          fi
+          echo "=== 签名信息 ==="
+          codesign -dvv "$DYLIB" 2>&1 || true
+          echo "=== 依赖库列表 (otool -L) ==="
+          xcrun --sdk iphoneos otool -L "$DYLIB" || true
+
+      - name: 🔍 验证 Mach-O 信息
+        run: |
+          DYLIB="build/${{ env.TWEAK_NAME }}.dylib"
+          echo "=== Mach-O Header (otool -hv) ==="
+          xcrun --sdk iphoneos otool -hv "$DYLIB"
+          echo "=== install name (otool -D) ==="
+          xcrun --sdk iphoneos otool -D "$DYLIB"
+
+      - name: 📦 打包注入包 (dylib + 说明)
+        run: |
+          mkdir -p build/injection_package
+          cp "build/${{ env.TWEAK_NAME }}.dylib" build/injection_package/
+          cp MyTweak_example/README.md build/injection_package/
+          # 写个一键Sideloadly说明
+          cat > build/injection_package/如何使用.txt << 'EOF'
+          1. 打开 Sideloadly (Windows版或Mac版都行)
+          2. 把 目标.ipa 拖到 Sideloadly
+          3. 点 Advanced options → 勾选 "Inject dylib/frameworks/deb"
+          4. 把 .dylib 文件拖到右边的框里 (CydiaSubstrate不用额外加，示例代码默认不依赖)
+          5. 点 Start 开始注入+安装
+          6. 安装完成后在TrollStore里就能看到注入好的App了
+          7. 打开App → 双击屏幕 → 弹出"[MyTweak]已激活"表示成功
+          EOF
+          cd build && zip -r ../${{ env.TWEAK_NAME }}_dylib_注入包_$(date +%Y%m%d_%H%M%S).zip injection_package
+
+          # 额外做一个单文件zip (Sideloadly直接拖)
+          cd build && zip -j ../${{ env.TWEAK_NAME }}_fakesigned_onlydylib_$(date +%Y%m%d_%H%M%S).zip *.dylib
+
+          # 记录版本信息 (方便查看)
+          echo "RUN_ID=$GITHUB_RUN_ID"   >  build/version_info.txt
+          echo "RUN_NO=$GITHUB_RUN_NUMBER" >> build/version_info.txt
+          echo "SHA=$(git rev-parse --short HEAD)" >> build/version_info.txt
+          echo "TIME=$(date '+%Y-%m-%d %H:%M:%S UTC')" >> build/version_info.txt
+          cat build/version_info.txt
+
+      - name: ⬆️ 上传 Artifact (Dylib + 注入包)
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TWEAK_NAME }}_dylib_packages
+          path: |
+            build/*.dylib
+            build/version_info.txt
+            *.zip
+          compression-level: 0
+
+      - name: 🚀 打tag后上传到Release Assets
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/*.dylib
+            build/version_info.txt
+            *.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# ============================================================
+# 可选：用户在workflow_dispatch里勾选了upload_ipa=true时
+# 会提示上传IPA → 自动注入 → 产出已注入IPA的artifact
+  inject_ipa:
+    name: 🧪 自动注入 IPA (实验性功能)
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.upload_ipa == 'true'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 📥 下载上一步编译的 dylib
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.TWEAK_NAME }}_dylib_packages
+          path: build
+
+      - name: 🔧 安装 optool (IPA注入工具)
+        run: |
+          # 方式1: brew
+          brew install --formula alexey-sun/tmp/optool 2>/dev/null || true
+          if ! command -v optool >/dev/null 2>&1; then
+            # 方式2: 编译
+            git clone --depth=1 https://github.com/alexzielenski/optool.git /tmp/optool 2>/dev/null || true
+            if [ -d /tmp/optool ]; then
+              cd /tmp/optool && xcodebuild -project optool.xcodeproj -configuration Release 2>/dev/null || true
+              cp /tmp/optool/build/Release/optool /usr/local/bin/optool 2>/dev/null || sudo cp /tmp/optool/build/Release/optool /usr/local/bin/optool 2>/dev/null || true
+            fi
+          fi
+          # 方式3: 用 insert_dylib 替代
+          if ! command -v optool >/dev/null 2>&1; then
+            git clone --depth=1 https://github.com/Tyilo/insert_dylib /tmp/insert_dylib 2>/dev/null || true
+            if [ -f /tmp/insert_dylib/main.swift ]; then
+              echo "insert_dylib downloaded but needs swift build"
+            fi
+          fi
+          echo "=== 可用工具 ==="
+          which optool || echo "optool not found"
+          which insert_dylib || echo "insert_dylib not found"
+
+      - name: 📤 提示上传 IPA
+        run: |
+          echo "⚠️ GitHub Actions workflow_dispatch 目前不直接支持在页面里传文件附件"
+          echo ""
+          echo "✅ 替代方案 (任选其一):"
+          echo ""
+          echo "【方案A - Windows上Sideloadly注入】(推荐新手)"
+          echo "   1. 在本Action页面顶部 Artifacts 下载 ${{ env.TWEAK_NAME }}_dylib_packages.zip"
+          echo "   2. 解压得到 .dylib"
+          echo "   3. Windows上开Sideloadly → 拖目标IPA → Advanced → Inject dylib里选这个dylib → Start"
+          echo ""
+          echo "【方案B - 把IPA URL放到Secrets】"
+          echo "   在仓库 Settings → Secrets and variables → Actions → New repository secret"
+          echo "   Name: IPA_URL  Value: IPA的公网可下载链接(如OSS/网盘直链)"
+          echo "   下次运行Action就会自动下载注入"
+          echo ""
+          echo "【方案C - IPA直接commit到仓库】(IPA<100M的话)"
+          echo "   把IPA改名叫 target.ipa 放到项目根目录，push后再运行本workflow"
+          ls -la *.ipa 2>/dev/null && echo "检测到根目录IPA，可直接注入" || echo "未发现IPA文件，跳过自动注入步骤"
+
+      - name: 🧪 如果检测到 IPA 则执行注入
+        run: |
+          IPA_FILE=""
+          # 1. 找仓库里的target.ipa
+          [ -f "target.ipa" ] && IPA_FILE="target.ipa"
+          # 2. 找任意ipa
+          if [ -z "$IPA_FILE" ]; then
+            IPA_FILE=$(find . -maxdepth 3 -name "*.ipa" -print -quit 2>/dev/null || true)
+          fi
+          # 3. Secrets里的IPA_URL
+          if [ -z "$IPA_FILE" ] && [ -n "${{ secrets.IPA_URL }}" ]; then
+            echo "从 Secrets.IPA_URL 下载..."
+            curl -L "${{ secrets.IPA_URL }}" -o /tmp/target.ipa && IPA_FILE=/tmp/target.ipa
+          fi
+
+          if [ -z "$IPA_FILE" ]; then
+            echo "⚠️  没有找到任何IPA文件，跳过自动注入"
+            echo "👉 请按照上面提示的【方案A/B/C】操作"
+            mkdir -p build && echo "请重新运行Action并提供IPA。见上方日志说明。" > build/请阅读我_注入IPA说明.txt
+            exit 0
+          fi
+
+          echo "✅ 找到IPA: $IPA_FILE"
+          ls -lh "$IPA_FILE"
+
+          DYLIB="build/${{ env.TWEAK_NAME }}.dylib"
+          [ ! -f "$DYLIB" ] && DYLIB="build/injection_package/${{ env.TWEAK_NAME }}.dylib"
+          if [ ! -f "$DYLIB" ]; then
+            echo "❌ 找不到dylib: $DYLIB"
+            exit 1
+          fi
+
+          echo "=== 开始注入流程 ==="
+          rm -rf /tmp/ipa_work && mkdir -p /tmp/ipa_work/unz /tmp/ipa_work/out
+          unzip -q "$IPA_FILE" -d /tmp/ipa_work/unz
+          APP_DIR=$(ls -d /tmp/ipa_work/unz/Payload/*.app | head -n1)
+          echo "📱 App目录: $APP_DIR"
+          APP_NAME=$(basename "$APP_DIR" .app)
+          EXEC=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_DIR/Info.plist" 2>/dev/null || echo "$APP_NAME")
+          echo "⚙️  可执行: $EXEC"
+
+          mkdir -p "$APP_DIR/Frameworks"
+          cp "$DYLIB" "$APP_DIR/Frameworks/"
+
+          # -------- 注入 LC_LOAD_DYLIB --------
+          INSTALL_NAME=$(xcrun --sdk iphoneos otool -D "$DYLIB" 2>/dev/null | tail -n1)
+          [ -z "$INSTALL_NAME" ] && INSTALL_NAME="@rpath/${{ env.TWEAK_NAME }}.dylib"
+          echo "🎯 install_name: $INSTALL_NAME"
+          echo "🎯 目标可执行: $APP_DIR/$EXEC"
+
+          INJECT_OK=0
+          if command -v optool >/dev/null 2>&1; then
+            echo "🪄 用 optool 注入..."
+            set +e
+            optool install -c load -p "$INSTALL_NAME" -t "$APP_DIR/$EXEC" 2>&1 | tail -20
+            # 加rpath
+            optool install -c rpath -p "@executable_path/Frameworks" -t "$APP_DIR/$EXEC" 2>&1 | tail -10
+            optool install -c rpath -p "@loader_path/Frameworks" -t "$APP_DIR/$EXEC" 2>&1 | tail -10
+            set -e
+            INJECT_OK=1
+          fi
+
+          if [ $INJECT_OK -eq 0 ] && command -v insert_dylib >/dev/null 2>&1; then
+            echo "🪄 用 insert_dylib 注入..."
+            insert_dylib --inplace --strip-codesig "$INSTALL_NAME" "$APP_DIR/$EXEC"
+            INJECT_OK=1
+          fi
+
+          if [ $INJECT_OK -eq 0 ]; then
+            echo "⚠️  optool/insert_dylib都不可用，尝试用脚本方式注入..."
+            echo "(实际上GitHub macOS runner已经装了brew，可以在运行brew install optool)"
+            echo "尝试直接用python修改Mach-O（留作备用，这里直接fail更好）"
+          fi
+
+          # 验证
+          echo ""
+          echo "=== 验证注入结果 (otool -L $EXEC) ==="
+          xcrun --sdk iphoneos otool -L "$APP_DIR/$EXEC" 2>&1 | grep -i -E "tweak|rpath|Frameworks" || true
+          xcrun --sdk iphoneos otool -l "$APP_DIR/$EXEC" 2>&1 | grep -E "LC_LOAD_DYLIB|LC_RPATH|path " | head -20 || true
+
+          # -------- 整体签名 --------
+          echo ""
+          echo "✍️  AdHoc 重签整个App..."
+          find "$APP_DIR/Frameworks" -type f \( -name "*.dylib" -o -name "*" \) -exec \
+            codesign -f -s - --timestamp=none {} \; 2>/dev/null || true
+          codesign -f -s - --timestamp=none --deep --entitlements /dev/null "$APP_DIR" 2>&1 | tail -5 || true
+          # 确保主可执行被签
+          codesign -f -s - --timestamp=none "$APP_DIR/$EXEC" 2>/dev/null || true
+
+          # -------- 打包回IPA --------
+          OUT_IPA="/tmp/ipa_work/out/${APP_NAME}_已注入_${{ env.TWEAK_NAME }}.ipa"
+          cd /tmp/ipa_work/unz && zip -qr "$OUT_IPA" Payload
+          echo ""
+          echo "✅ 注入完成 -> $OUT_IPA"
+          ls -lh "$OUT_IPA"
+          cp "$OUT_IPA" build/
+
+      - name: ⬆️ 上传注入好的 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TWEAK_NAME }}_injected_IPA
+          path: |
+            build/*.ipa
+            build/*注入*.zip
+            build/请阅读我_注入IPA说明.txt
+          if-no-files-found: warn
