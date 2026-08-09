@@ -353,7 +353,7 @@ static void PDDEntry(void) {
                     }
                 }
                 
-                // === 安装双击手势 ===
+                // === 安装悬浮窗 ===
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     UIWindow *key = nil;
                     for (UIWindow *w in [UIApplication sharedApplication].windows) {
@@ -361,14 +361,100 @@ static void PDDEntry(void) {
                     }
                     if (!key) key = [UIApplication sharedApplication].keyWindow;
                     if (key) {
-                        if (!class_getInstanceMethod([key class], @selector(pddsaver_doubleTap:))) {
-                            class_addMethod([key class], @selector(pddsaver_doubleTap:), (IMP)showMenu, "v@:@");
-                        }
-                        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:key action:@selector(pddsaver_doubleTap:)];
-                        tap.numberOfTapsRequired = 2;
-                        tap.cancelsTouchesInView = NO;
-                        [key addGestureRecognizer:tap];
-                        HHLog(@"✅ 双击手势已安装到 %@", key);
+                        // 创建悬浮窗容器
+                        CGFloat btnSize = 44.0;
+                        CGFloat screenW = key.bounds.size.width;
+                        CGFloat margin = 10.0;
+                        
+                        UIView *floatBtn = [[UIView alloc] initWithFrame:CGRectMake(screenW - btnSize - margin, 120, btnSize, btnSize)];
+                        floatBtn.backgroundColor = [[UIColor colorWithRed:0.98 green:0.31 blue:0.31 alpha:1.0] colorWithAlphaComponent:0.92];
+                        floatBtn.layer.cornerRadius = btnSize / 2;
+                        floatBtn.layer.shadowColor = [UIColor blackColor].CGColor;
+                        floatBtn.layer.shadowOffset = CGSizeMake(0, 2);
+                        floatBtn.layer.shadowOpacity = 0.3;
+                        floatBtn.layer.shadowRadius = 4;
+                        
+                        // 图标用文字
+                        UILabel *icon = [[UILabel alloc] initWithFrame:floatBtn.bounds];
+                        icon.text = @"📷";
+                        icon.font = [UIFont systemFontOfSize:20];
+                        icon.textAlignment = NSTextAlignmentCenter;
+                        [floatBtn addSubview:icon];
+                        
+                        // 拖拽手势
+                        __block CGPoint panStart;
+                        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:[NSNull null] action:nil];
+                        __weak UIView *weakBtn = floatBtn;
+                        __weak UIPanGestureRecognizer *weakPan = pan;
+                        // 用block实现拖拽
+                        IMP panBlock = imp_implementationWithBlock(^(id _self, UIPanGestureRecognizer *gesture){
+                            UIView *btn = weakBtn;
+                            if (!btn) return;
+                            CGPoint trans = [gesture translationInView:key];
+                            if (gesture.state == UIGestureRecognizerStateBegan) {
+                                panStart = btn.center;
+                            }
+                            btn.center = CGPointMake(panStart.x + trans.x, panStart.y + trans.y);
+                            if (gesture.state == UIGestureRecognizerStateEnded) {
+                                // 贴边
+                                [UIView animateWithDuration:0.2 animations:^{
+                                    CGFloat w = btn.frame.size.width / 2;
+                                    CGFloat cx = btn.center.x;
+                                    if (cx < key.bounds.size.width / 2) {
+                                        cx = w + margin;
+                                    } else {
+                                        cx = key.bounds.size.width - w - margin;
+                                    }
+                                    CGFloat cy = btn.center.y;
+                                    if (cy < 80) cy = 80 + w;
+                                    if (cy > key.bounds.size.height - 160) cy = key.bounds.size.height - 160 - w;
+                                    btn.center = CGPointMake(cx, cy);
+                                }];
+                            }
+                        });
+                        class_addMethod([floatBtn class], @selector(handlePan:), panBlock, "v@:@");
+                        [pan addTarget:floatBtn action:@selector(handlePan:)];
+                        [floatBtn addGestureRecognizer:pan];
+                        
+                        // 点击手势
+                        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:[NSNull null] action:nil];
+                        IMP tapBlock = imp_implementationWithBlock(^(id _self, UITapGestureRecognizer *gesture){
+                            showMenu(floatBtn);
+                        });
+                        class_addMethod([floatBtn class], @selector(handleTap:), tapBlock, "v@:@");
+                        [tap addTarget:floatBtn action:@selector(handleTap:)];
+                        [floatBtn addGestureRecognizer:tap];
+                        
+                        // 计数器label
+                        UILabel *badge = [[UILabel alloc] initWithFrame:CGRectMake(btnSize - 15, -3, 18, 18)];
+                        badge.backgroundColor = [UIColor whiteColor];
+                        badge.textColor = [UIColor colorWithRed:0.98 green:0.31 blue:0.31 alpha:1.0];
+                        badge.font = [UIFont systemFontOfSize:10 weight:UIFontWeightBold];
+                        badge.textAlignment = NSTextAlignmentCenter;
+                        badge.layer.cornerRadius = 9;
+                        badge.layer.masksToBounds = YES;
+                        badge.tag = 999;
+                        badge.hidden = YES;
+                        [floatBtn addSubview:badge];
+                        
+                        [key addSubview:floatBtn];
+                        HHLog(@"✅ 悬浮窗已安装到 %@", key);
+                        
+                        // 定时刷新badge数字
+                        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                            while (1) {
+                                dispatch_async(dispatch_get_main_queue(), ^{
+                                    NSInteger c = [[PDDSaverImageCollector shared] allImages].count;
+                                    if (c > 0) {
+                                        badge.hidden = NO;
+                                        badge.text = [NSString stringWithFormat:@"%ld", (long)MIN(c, 99)];
+                                    } else {
+                                        badge.hidden = YES;
+                                    }
+                                });
+                                [NSThread sleepForTimeInterval:2.0];
+                            }
+                        });
                     }
                 });
                 
