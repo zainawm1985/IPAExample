@@ -269,10 +269,10 @@ static void PDDEntry(void) {
                     SEL sel2 = @selector(downloadImageWithURL:options:progress:completed:);
                     SEL sel3 = @selector(downloadImageWithURL:);
                     
-                    for (SEL s in @[sel1, sel2, sel3]) {
-                        if ([downloaderCls instancesRespondToSelector:s]) {
-                            HHLog(@"  Hook方法: %@", NSStringFromSelector(s));
-                            // 不太好直接hook多参数block方法，换一个思路Hook NSURLConnection/NSURLSession
+                    SEL sels[] = {sel1, sel2, sel3};
+                    for (int si = 0; si < 3; si++) {
+                        if ([downloaderCls instancesRespondToSelector:sels[si]]) {
+                            HHLog(@"  Hook方法: %@", NSStringFromSelector(sels[si]));
                             break;
                         }
                     }
@@ -329,7 +329,7 @@ static void PDDEntry(void) {
                         HHLog(@"✅ GoodsImageModel.%@ Hook 安装成功", NSStringFromSelector(urlSel));
                     } else {
                         HHLog(@"⚠️ GoodsImageModel 存在但没有找到setUrl方法，打印属性:");
-                        [PDDSaverImageCollector tryScanGoodsModel];
+                        tryScanGoodsModel();
                     }
                 } else {
                     HHLog(@"⚠️ GoodsImageModel 类不存在");
