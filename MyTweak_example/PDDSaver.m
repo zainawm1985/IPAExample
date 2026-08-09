@@ -1,13 +1,6 @@
 //
-//  PDDSaver.m
-//  PDD 商品图片一键提取 Tweak
-//
-//  策略1: Hook SDWebImage → 拦截所有加载的图片URL → 按域名过滤保留商品图
-//  策略2: Hook AMImageURLInfo → 直接读取商品Model里的图片URL
-//  策略3: Hook PDDGoodsDetailPhotoController → 拿到当前详情页所有图片
-//
-//  注入到PDD后：浏览商品 → 双击屏幕 → 自动复制所有图片URL到粘贴板
-//                              → 弹出菜单选择"保存全部图片"
+//  PDDSaver.m  v2
+//  浮窗实时显示 + 多层兜底Hook
 //
 
 #import <UIKit/UIKit.h>
@@ -18,447 +11,466 @@
 
 #define HHLog(fmt, ...) NSLog(@"[PDDSaver] " fmt, ##__VA_ARGS__)
 
-// ================ 图片URL收集器 ================
-@interface PDDSaverImageCollector : NSObject
-+ (instancetype)shared;
-- (void)addImageURL:(NSString *)url title:(NSString *)title;
-- (NSArray<NSDictionary *> *)allImages;
+// ==================== 图片收集器 ====================
+@interface ImgCollector : NSObject
+@property (nonatomic, copy) void(^onCountChanged)(NSInteger count);
+- (void)addURL:(NSString *)url from:(NSString *)source;
+- (NSArray<NSString *> *)allURLs;
 - (void)clear;
-- (void)saveAllToAlbum;
+- (NSInteger)count;
 @end
 
-@implementation PDDSaverImageCollector {
-    NSMutableArray<NSDictionary *> *_images;
-    NSMutableSet<NSString *> *_urlSet;  // 去重
-    dispatch_queue_t _queue;
+@implementation ImgCollector {
+    NSMutableArray<NSString *> *_urls;
+    NSMutableSet<NSString *> *_seen;
+}
+- (instancetype)init { self = [super init]; _urls = [NSMutableArray new]; _seen = [NSMutableSet new]; return self; }
+- (void)addURL:(NSString *)url from:(NSString *)source {
+    if (!url.length) return;
+    @synchronized(_seen) {
+        if ([_seen containsObject:url]) return;
+        [_seen addObject:url];
+    }
+    @synchronized(_urls) { [_urls addObject:url]; }
+    HHLog(@"📷 +1 [%lu] src=%@ url=%@", (unsigned long)_seen.count, source, url);
+    if (self.onCountChanged) dispatch_async(dispatch_get_main_queue(), ^{ self.onCountChanged(self.count); });
+}
+- (NSArray<NSString *> *)allURLs { @synchronized(_urls) { return _urls.copy; } }
+- (void)clear { @synchronized(_urls) { [_urls removeAllObjects]; } @synchronized(_seen) { [_seen removeAllObjects]; } }
+- (NSInteger)count { @synchronized(_seen) { return _seen.count; } }
+@end
+
+// ==================== 悬浮窗 ====================
+@interface FloatBall : UIButton
+@property (nonatomic, strong) ImgCollector *collector;
++ (void)showWithCollector:(ImgCollector *)c;
+@end
+
+@implementation FloatBall {
+    CGPoint _startPoint;
+    UILabel *_badge;
 }
 
-+ (instancetype)shared {
-    static PDDSaverImageCollector *inst;
-    static dispatch_once_t t;
-    dispatch_once(&t, ^{ inst = [[PDDSaverImageCollector alloc] init]; });
-    return inst;
++ (void)showWithCollector:(ImgCollector *)c {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        FloatBall *ball = [[FloatBall alloc] initWithFrame:CGRectMake(10, 200, 56, 56)];
+        ball.collector = c;
+        UIWindow *kw = [UIApplication sharedApplication].keyWindow;
+        if (!kw) kw = [UIApplication sharedApplication].windows.lastObject;
+        [kw addSubview:ball];
+        c.onCountChanged = ^(NSInteger n) { [ball updateBadge:n]; };
+        HHLog(@"🟢 悬浮窗已显示");
+    });
 }
 
-- (instancetype)init {
-    if (self = [super init]) {
-        _images = [NSMutableArray array];
-        _urlSet = [NSMutableSet set];
-        _queue = dispatch_queue_create("com.pddsaver.collect", DISPATCH_QUEUE_SERIAL);
+- (instancetype)initWithFrame:(CGRect)frame {
+    if (self = [super initWithFrame:frame]) {
+        self.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.75];
+        self.layer.cornerRadius = 28;
+        self.layer.borderColor = [UIColor whiteColor].CGColor;
+        self.layer.borderWidth = 2;
+        self.layer.shadowColor = [UIColor blackColor].CGColor;
+        self.layer.shadowOffset = CGSizeMake(0, 2);
+        self.layer.shadowRadius = 4;
+        self.layer.shadowOpacity = 0.4;
+        self.clipsToBounds = NO;
+        
+        _badge = [[UILabel alloc] initWithFrame:CGRectMake(-6, -6, 24, 24)];
+        _badge.backgroundColor = [UIColor systemRedColor];
+        _badge.textColor = [UIColor whiteColor];
+        _badge.font = [UIFont boldSystemFontOfSize:11];
+        _badge.textAlignment = NSTextAlignmentCenter;
+        _badge.layer.cornerRadius = 12;
+        _badge.clipsToBounds = YES;
+        _badge.text = @"0";
+        [self addSubview:_badge];
+        
+        UILabel *icon = [[UILabel alloc] initWithFrame:CGRectMake(8, 6, 40, 24)];
+        icon.text = @"📷";
+        icon.font = [UIFont systemFontOfSize:18];
+        icon.textAlignment = NSTextAlignmentCenter;
+        [self addSubview:icon];
+        
+        [self addTarget:self action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)];
+        [self addGestureRecognizer:pan];
     }
     return self;
 }
 
-- (void)addImageURL:(NSString *)url title:(NSString *)title {
-    if (!url.length) return;
-    dispatch_async(_queue, ^{
-        @synchronized (_urlSet) {
-            if ([_urlSet containsObject:url]) return;
-            [_urlSet addObject:url];
-        }
-        @synchronized (_images) {
-            [_images addObject:@{@"url": url, @"title": title ?: @""}];
-        }
-        HHLog(@"📷 捕获图片 [%@]: %@", title, url);
-    });
+- (void)updateBadge:(NSInteger)n {
+    _badge.text = [NSString stringWithFormat:@"%ld", (long)n];
+    if (n > 0) _badge.backgroundColor = [UIColor systemGreenColor];
+    else _badge.backgroundColor = [UIColor systemRedColor];
 }
 
-- (NSArray<NSDictionary *> *)allImages {
-    @synchronized (_images) {
-        return [_images copy];
+- (void)drag:(UIPanGestureRecognizer *)g {
+    UIView *v = g.view;
+    if (g.state == UIGestureRecognizerStateBegan) _startPoint = v.center;
+    CGPoint t = [g translationInView:v.superview];
+    v.center = CGPointMake(_startPoint.x + t.x, _startPoint.y + t.y);
+    if (g.state == UIGestureRecognizerStateEnded) {
+        CGFloat x = v.center.x, w = v.superview.bounds.size.width;
+        v.center = CGPointMake(x < w/2 ? 38 : w-38, MAX(100, MIN(v.center.y, v.superview.bounds.size.height-100)));
     }
 }
 
-- (void)clear {
-    @synchronized (_images) { [_images removeAllObjects]; }
-    @synchronized (_urlSet) { [_urlSet removeAllObjects]; }
-}
-
-- (void)saveAllToAlbum {
-    NSArray *imgs = [self allImages];
-    NSString *text = [NSString stringWithFormat:@"📦 PDD商品图片 (%lu张)\n\n", (unsigned long)imgs.count];
-    for (NSDictionary *d in imgs) {
-        text = [text stringByAppendingFormat:@"%@\n", d[@"url"]];
-    }
-    [[UIPasteboard generalPasteboard] setString:text];
-    HHLog(@"✅ 已复制 %lu 张图片URL到粘贴板", (unsigned long)imgs.count);
-}
-@end
-
-// ================ 策略1: Hook SDWebImage ================
-// SDWebImageDownloader 负责下载图片, SDWebImageManager 负责调度
-
-static void (*orig_SDWebImageDownloader_download_)(id, SEL, id, id, id);
-static void hook_SDWebImageDownloader_download(id self, SEL _cmd, id url, id options, id context) {
-    // url可能是NSURL或NSString
-    NSString *urlStr = nil;
-    if ([url isKindOfClass:[NSURL class]]) {
-        urlStr = [((NSURL *)url) absoluteString];
-    } else if ([url isKindOfClass:[NSString class]]) {
-        urlStr = (NSString *)url;
-    }
+- (void)tap {
+    NSArray *urls = [self.collector allURLs];
+    NSInteger n = urls.count;
     
-    if (urlStr) {
-        // 只过滤PDD图片域名
-        if ([urlStr containsString:@"pddpic.com"] ||
-            [urlStr containsString:@"yangkeduo.com"] ||
-            [urlStr containsString:@"pddcdn.com"]) {
-            // 过滤掉明显的UI icon (太小的图)
-            if ([urlStr rangeOfString:@"icon" options:NSCaseInsensitiveSearch].location == NSNotFound &&
-                [urlStr rangeOfString:@"avatar" options:NSCaseInsensitiveSearch].location == NSNotFound &&
-                [urlStr rangeOfString:@"arrow" options:NSCaseInsensitiveSearch].location == NSNotFound) {
-                [[PDDSaverImageCollector shared] addImageURL:urlStr title:@"SDWebImage拦截"];
-            }
-        }
-    }
-    if (orig_SDWebImageDownloader_download_) {
-        orig_SDWebImageDownloader_download_(self, _cmd, url, options, context);
-    }
-}
-
-// ================ 策略2: Hook GoodsImageModel ================
-
-static void (*orig_GoodsImageModel_setUrl_)(id, SEL, id);
-static void hook_GoodsImageModel_setUrl(id self, SEL _cmd, id url) {
-    if (orig_GoodsImageModel_setUrl_) orig_GoodsImageModel_setUrl_(self, _cmd, url);
-    NSString *urlStr = nil;
-    if ([url isKindOfClass:[NSString class]]) urlStr = url;
-    else if ([url isKindOfClass:[NSURL class]]) urlStr = [url absoluteString];
-    if (urlStr && [urlStr containsString:@"pddpic.com"]) {
-        // 尝试取goodsName或title
-        NSString *title = @"商品图";
-        if ([self respondsToSelector:@selector(title)]) {
-            id t = [self performSelector:@selector(title)];
-            if ([t isKindOfClass:[NSString class]]) title = t;
-        } else if ([self respondsToSelector:@selector(goods_name)]) {
-            id t = [self performSelector:@selector(goods_name)];
-            if ([t isKindOfClass:[NSString class]]) title = t;
-        }
-        [[PDDSaverImageCollector shared] addImageURL:urlStr title:title];
-    }
-}
-
-// ================ 策略3: Hook AMImageURLInfo ================
-
-static void (*orig_AMImageURLInfo_setUrl_)(id, SEL, id);
-static void hook_AMImageURLInfo_setUrl(id self, SEL _cmd, id url) {
-    if (orig_AMImageURLInfo_setUrl_) orig_AMImageURLInfo_setUrl_(self, _cmd, url);
-    NSString *urlStr = nil;
-    if ([url isKindOfClass:[NSString class]]) urlStr = url;
-    else if ([url isKindOfClass:[NSURL class]]) urlStr = [url absoluteString];
-    if (urlStr && ([urlStr containsString:@"pddpic.com"] || [urlStr containsString:@"yangkeduo.com"])) {
-        [[PDDSaverImageCollector shared] addImageURL:urlStr title:@"AMImageURLInfo"];
-    }
-}
-
-// ================ UI工具方法 ================
-
-static void showToast(NSString *text, UIView *view) {
-    UILabel *l = [[UILabel alloc] init];
-    l.text = text;
-    l.textColor = [UIColor whiteColor];
-    l.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.8];
-    l.textAlignment = NSTextAlignmentCenter;
-    l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-    l.layer.cornerRadius = 8;
-    l.layer.masksToBounds = YES;
-    l.frame = CGRectMake(0, 0, 200, 40);
-    l.center = CGPointMake(view.bounds.size.width/2, view.bounds.size.height - 150);
-    l.alpha = 0;
-    [view addSubview:l];
-    [UIView animateWithDuration:0.3 animations:^{ l.alpha = 1; }];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [UIView animateWithDuration:0.3 animations:^{ l.alpha = 0; } completion:^(BOOL f){ [l removeFromSuperview]; }];
-    });
-}
-
-static void tryScanGoodsModel(void) {
-    Class goodsModelCls = objc_getClass("GoodsModel");
-    Class goodsImgModelCls = objc_getClass("GoodsImageModel");
-    HHLog(@"GoodsModel: %@, GoodsImageModel: %@", goodsModelCls, goodsImgModelCls);
-    if (goodsImgModelCls) {
-        unsigned int pCount = 0;
-        objc_property_t *props = class_copyPropertyList(goodsImgModelCls, &pCount);
-        HHLog(@"GoodsImageModel 属性列表:");
-        for (unsigned int i = 0; i < pCount && i < 20; i++) {
-            HHLog(@"  - %s", property_getName(props[i]));
-        }
-        free(props);
-    }
-}
-
-// ================ 双击手势菜单 ================
-
-static void showMenu(UIView *view) {
-    UIViewController *vc = nil;
-    UIResponder *resp = view;
-    while (resp && ![resp isKindOfClass:[UIViewController class]]) resp = [resp nextResponder];
-    vc = (UIViewController *)resp;
+    // 找当前VC
+    UIResponder *r = self;
+    while (r && ![r isKindOfClass:[UIViewController class]]) r = [r nextResponder];
+    UIViewController *vc = (UIViewController *)r;
     if (!vc) {
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (!w.hidden && w.rootViewController) {
-                vc = w.rootViewController;
-                while (vc.presentedViewController) vc = vc.presentedViewController;
-                break;
-            }
-        }
+        UIWindow *kw = [UIApplication sharedApplication].keyWindow;
+        vc = kw.rootViewController;
+        while (vc.presentedViewController) vc = vc.presentedViewController;
     }
-    if (!vc) return;
     
-    NSArray *images = [[PDDSaverImageCollector shared] allImages];
-    NSInteger count = images.count;
-    
+    NSString *msg = n > 0 ? [NSString stringWithFormat:@"已捕获 %ld 张图片\n点复制后粘贴到电脑即可", (long)n] : @"尚未捕获到商品图片\n请浏览商品页试试";
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"📷 PDD图片提取"
-                                                                message:[NSString stringWithFormat:@"已捕获 %ld 张商品图片", (long)count]
-                                                         preferredStyle:UIAlertControllerStyleActionSheet];
-    
-    if (count > 0) {
-        [ac addAction:[UIAlertAction actionWithTitle:@"📋 复制全部URL到粘贴板" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            [[PDDSaverImageCollector shared] saveAllToAlbum];
-            showToast(@"✅ URL已复制！", vc.view);
+                                                                 message:msg
+                                                          preferredStyle:UIAlertControllerStyleActionSheet];
+    if (n > 0) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"📋 复制全部URL" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+            NSString *txt = @"";
+            for (NSString *u in urls) txt = [txt stringByAppendingFormat:@"%@\n", u];
+            [UIPasteboard generalPasteboard].string = txt;
+            [self toast:[NSString stringWithFormat:@"已复制 %ld 个URL", (long)n] inView:vc.view];
         }]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"🗑️ 清空已收集" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-            [[PDDSaverImageCollector shared] clear];
-            showToast(@"已清空", vc.view);
+        [ac addAction:[UIAlertAction actionWithTitle:@"🗑️ 清空" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
+            [self.collector clear];
+            [self updateBadge:0];
+            [self toast:@"已清空" inView:vc.view];
         }]];
     }
-    [ac addAction:[UIAlertAction actionWithTitle:@"🔄 扫描GoodsImageModel" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        tryScanGoodsModel();
-        showToast(@"已扫描，看日志", vc.view);
-    }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    
-    if ([ac respondsToSelector:@selector(popoverPresentationController)]) {
-        ac.popoverPresentationController.sourceView = view;
-        ac.popoverPresentationController.sourceRect = CGRectMake(view.bounds.size.width/2, view.bounds.size.height/2, 0, 0);
-    }
     [vc presentViewController:ac animated:YES completion:nil];
 }
 
-// ================ swizzle 工具 ================
-static void swizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *origStore) {
-    Method m = class_getClassMethod(cls, sel);
-    if (!m) {
-        // 尝试实例方法
-        m = class_getInstanceMethod(cls, sel);
-        if (!m) { HHLog(@"⚠️ 方法不存在 %@ %@", cls, NSStringFromSelector(sel)); return; }
-    }
-    if (origStore) *origStore = method_getImplementation(m);
-    method_setImplementation(m, newImp);
-    HHLog(@"✅ Hook: %@ %@", cls, NSStringFromSelector(sel));
+- (void)toast:(NSString *)t inView:(UIView *)v {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(0,0,220,40)];
+    l.text = t; l.textColor = UIColor.whiteColor; l.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.85];
+    l.textAlignment = NSTextAlignmentCenter; l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    l.layer.cornerRadius = 8; l.clipsToBounds = YES;
+    l.center = CGPointMake(v.bounds.size.width/2, v.bounds.size.height*0.55);
+    l.alpha = 0; [v addSubview:l];
+    [UIView animateWithDuration:0.25 animations:^{ l.alpha = 1; }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2*NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        [UIView animateWithDuration:0.25 animations:^{ l.alpha = 0; } completion:^(BOOL f){ [l removeFromSuperview]; }];
+    });
+}
+@end
+
+// ==================== 图片URL过滤 ====================
+static BOOL isGoodImageURL(NSString *s) {
+    if (!s || s.length < 5) return NO;
+    // 只保留PDD图片域名
+    if (![s containsString:@"pddpic.com"] &&
+        ![s containsString:@"yangkeduo.com"] &&
+        ![s containsString:@"pddcdn.com"]) return NO;
+    // 排除UI图
+    s = [s lowercaseString];
+    if ([s containsString:@"icon"] || [s containsString:@"avatar"] || [s containsString:@"arrow"] ||
+        [s containsString:@"badge"] || [s containsString:@"button"] || [s containsString:@"navi"] ||
+        [s containsString:@"tab"] || [s containsString:@"back"] || [s containsString:@"close"] ||
+        [s containsString:@"logo"] || [s containsString:@"loading"] || [s containsString:@"placeholder"] ||
+        [s containsString:@"empty"]) return NO;
+    return YES;
 }
 
-// ================ dylib 入口 ================
+// ==================== Hook逻辑 ====================
+
+static ImgCollector *g_collector = nil;
+
+// ---- Hook 1: SDWebImageManager (新版5.x API) ----
+static void hook_SDWebImageManager(void) {
+    Class cls = objc_getClass("SDWebImageManager");
+    if (!cls) { HHLog(@"⚠️ SDWebImageManager 类不存在"); return; }
+    HHLog(@"✅ 找到 SDWebImageManager");
+
+    // 新版SDWebImage API: 
+    // loadImageWithURL:options:context:progress:completed:
+    // loadImageWithURL:options:progress:completed:
+    SEL sels[] = {
+        @selector(loadImageWithURL:options:context:progress:completed:),
+        @selector(loadImageWithURL:options:progress:completed:),
+        @selector(loadImageWithURL:progress:completed:),
+    };
+    
+    for (int i = 0; i < 3; i++) {
+        Method m = class_getInstanceMethod(cls, sels[i]);
+        if (m) {
+            IMP orig = method_getImplementation(m);
+            IMP new = imp_implementationWithBlock(^(id self, NSURL *url, ...) {
+                // 只拦截url参数来记录，不干扰原始逻辑
+                if (url && [url isKindOfClass:[NSURL class]]) {
+                    NSString *s = url.absoluteString;
+                    if (isGoodImageURL(s)) [g_collector addURL:s from:@"SDWebMgr"];
+                }
+                
+                // 转发到原始实现
+                // 用va_list处理可变参数
+                va_list args;
+                va_start(args, url);
+                void *arg2 = va_arg(args, void *);
+                void *arg3 = va_arg(args, void *);
+                id arg4 = va_arg(args, id);
+                id arg5 = va_arg(args, id);
+                va_end(args);
+                
+                // 根据原始方法签名调用
+                typedef void (*fn5)(id, SEL, NSURL *, void *, void *, id, id);
+                ((fn5)orig)(self, sels[i], url, arg2, arg3, arg4, arg5);
+            });
+            method_setImplementation(m, new);
+            HHLog(@"✅ Hook SDWebImageManager: %@", NSStringFromSelector(sels[i]));
+            return;
+        }
+    }
+    HHLog(@"⚠️ SDWebImageManager 未找到匹配方法，打印可用方法:");
+    unsigned int mc = 0;
+    Method *ms = class_copyMethodList(cls, &mc);
+    for (unsigned int i = 0; i < MIN(mc, 30); i++) {
+        HHLog(@"  - %@", NSStringFromSelector(method_getName(ms[i])));
+    }
+    free(ms);
+}
+
+// ---- Hook 2: NSURLSession dataTaskWithURL (兜底，拦截网络请求) ----
+static void hook_NSURLSession(void) {
+    Class cls = objc_getClass("NSURLSession");
+    // Hook实例方法 dataTaskWithURL:completionHandler:
+    SEL sel = @selector(dataTaskWithURL:completionHandler:);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (m) {
+        IMP orig = method_getImplementation(m);
+        IMP new = imp_implementationWithBlock(^(id self, NSURL *url, id handler) {
+            if (url && [url isKindOfClass:[NSURL class]]) {
+                NSString *s = url.absoluteString;
+                if (isGoodImageURL(s)) [g_collector addURL:s from:@"NSURLSession"];
+            }
+            return ((id(*)(id,SEL,NSURL*,id))orig)(self, sel, url, handler);
+        });
+        method_setImplementation(m, new);
+        HHLog(@"✅ Hook NSURLSession dataTaskWithURL:");
+    } else {
+        HHLog(@"⚠️ NSURLSession dataTaskWithURL: 不存在");
+    }
+}
+
+// ---- Hook 3: NSURLRequest (拦截所有创建) ----
+static void hook_NSURLRequest(void) {
+    Class cls = objc_getClass("NSURLRequest");
+    SEL sel = @selector(requestWithURL:);
+    Method m = class_getClassMethod(cls, sel);
+    if (m) {
+        IMP orig = method_getImplementation(m);
+        IMP new = imp_implementationWithBlock(^(id self, NSURL *url) {
+            if (url && [url isKindOfClass:[NSURL class]]) {
+                NSString *s = url.absoluteString;
+                if (isGoodImageURL(s)) [g_collector addURL:s from:@"NSURLReq"];
+            }
+            return ((id(*)(id,SEL,NSURL*))orig)(self, sel, url);
+        });
+        method_setImplementation(m, new);
+        HHLog(@"✅ Hook NSURLRequest requestWithURL:");
+    }
+}
+
+// ---- Hook 4: SDWebImageDownloader ----
+static void hook_SDWebImageDownloader(void) {
+    Class cls = objc_getClass("SDWebImageDownloader");
+    if (!cls) { HHLog(@"⚠️ SDWebImageDownloader 不存在"); return; }
+    
+    SEL sels[] = {
+        @selector(downloadImageWithURL:options:context:),
+        @selector(downloadImageWithURL:options:progress:completed:),
+        @selector(downloadImageWithURL:completed:),
+    };
+    
+    for (int i = 0; i < 3; i++) {
+        Method m = class_getInstanceMethod(cls, sels[i]);
+        if (m) {
+            IMP orig = method_getImplementation(m);
+            IMP new = imp_implementationWithBlock(^(id self, NSURL *url, ...) {
+                if (url && [url isKindOfClass:[NSURL class]]) {
+                    NSString *s = url.absoluteString;
+                    if (isGoodImageURL(s)) [g_collector addURL:s from:@"SDDownload"];
+                }
+                va_list args; va_start(args, url);
+                void *a2 = va_arg(args, void *); void *a3 = va_arg(args, void *);
+                id a4 = va_arg(args, id); id a5 = va_arg(args, id); va_end(args);
+                typedef void (*fn)(id, SEL, NSURL *, void *, void *, id, id);
+                ((fn)orig)(self, sels[i], url, a2, a3, a4, a5);
+            });
+            method_setImplementation(m, new);
+            HHLog(@"✅ Hook SDWebImageDownloader: %@", NSStringFromSelector(sels[i]));
+            return;
+        }
+    }
+    HHLog(@"⚠️ SDWebImageDownloader 无匹配方法");
+}
+
+// ---- Hook 5: UIImageView sd_setImageWithURL (最简单直接的) ----
+static void hook_UIImageView_sd(void) {
+    // 这个hook的是UIImageView分类里的方法，最直观
+    // sd_setImageWithURL: 
+    SEL sel = @selector(sd_setImageWithURL:);
+    Method m = class_getInstanceMethod([UIImageView class], sel);
+    if (m) {
+        IMP orig = method_getImplementation(m);
+        IMP new = imp_implementationWithBlock(^(UIImageView *self, NSURL *url) {
+            if (url && [url isKindOfClass:[NSURL class]]) {
+                NSString *s = url.absoluteString;
+                if (isGoodImageURL(s)) [g_collector addURL:s from:@"UIImageView"];
+            }
+            ((void(*)(id,SEL,NSURL*))orig)(self, sel, url);
+        });
+        method_setImplementation(m, new);
+        HHLog(@"✅ Hook UIImageView sd_setImageWithURL:");
+    } else {
+        // 试试旧版带placeholder的方法
+        SEL sel2 = @selector(sd_setImageWithURL:placeholderImage:);
+        m = class_getInstanceMethod([UIImageView class], sel2);
+        if (m) {
+            IMP orig = method_getImplementation(m);
+            IMP new = imp_implementationWithBlock(^(UIImageView *self, NSURL *url, UIImage *placeholder) {
+                if (url && [url isKindOfClass:[NSURL class]]) {
+                    NSString *s = url.absoluteString;
+                    if (isGoodImageURL(s)) [g_collector addURL:s from:@"UIImageView"];
+                }
+                ((void(*)(id,SEL,NSURL*,UIImage*))orig)(self, sel2, url, placeholder);
+            });
+            method_setImplementation(m, new);
+            HHLog(@"✅ Hook UIImageView sd_setImageWithURL:placeholderImage:");
+        } else {
+            HHLog(@"⚠️ UIImageView sd_setImageWithURL: 未找到(可能不用SD加载图片)");
+        }
+    }
+}
+
+// ---- Hook 6: GoodsImageModel (精准hook) ----
+static void hook_GoodsImageModel(void) {
+    Class cls = objc_getClass("GoodsImageModel");
+    if (!cls) { HHLog(@"⚠️ GoodsImageModel 类不存在"); return; }
+    HHLog(@"✅ GoodsImageModel 存在，打印属性:");
+    unsigned int pc = 0;
+    objc_property_t *ps = class_copyPropertyList(cls, &pc);
+    for (unsigned int i = 0; i < pc; i++) {
+        const char *n = property_getName(ps[i]);
+        const char *attrs = property_getAttributes(ps[i]);
+        HHLog(@"  属性%d: %s (%s)", i+1, n, attrs ? attrs : "?");
+    }
+    free(ps);
+    
+    // 尝试常见属性名: url, imageUrl, thumbUrl, image_url, imgUrl, picUrl
+    NSArray *candidates = @[@"url", @"imageUrl", @"thumbUrl", @"image_url", @"imgUrl", @"picUrl", @"pictureUrl", @"src"];
+    for (NSString *attr in candidates) {
+        NSString *setter = [NSString stringWithFormat:@"set%@%@:", 
+                           [[attr substringToIndex:1] uppercaseString],
+                           [attr substringFromIndex:1]];
+        SEL sel = NSSelectorFromString(setter);
+        if ([cls instancesRespondToSelector:sel]) {
+            Method m = class_getInstanceMethod(cls, sel);
+            IMP orig = method_getImplementation(m);
+            IMP new = imp_implementationWithBlock(^(id self, NSString *url){
+                ((void(*)(id,SEL,NSString*))orig)(self, sel, url);
+                if (isGoodImageURL(url)) [g_collector addURL:url from:@"GoodsImgModel"];
+            });
+            method_setImplementation(m, new);
+            HHLog(@"✅ Hook GoodsImageModel: %@", setter);
+            return;
+        }
+    }
+    HHLog(@"⚠️ GoodsImageModel 未找到任何图片URL setter (已打印属性列表，请查看)");
+}
+
+// ---- Hook 7: AMImageURLInfo ----
+static void hook_AMImageURLInfo(void) {
+    Class cls = objc_getClass("AMImageURLInfo");
+    if (!cls) { HHLog(@"⚠️ AMImageURLInfo 不存在"); return; }
+    HHLog(@"✅ AMImageURLInfo 存在，尝试hook url setter");
+    
+    for (NSString *a in @[@"url", @"imageUrl", @"thumbUrl", @"rawUrl", @"originUrl"]) {
+        NSString *s = [NSString stringWithFormat:@"set%@%@:", 
+                       [[a substringToIndex:1] uppercaseString], [a substringFromIndex:1]];
+        SEL sel = NSSelectorFromString(s);
+        if ([cls instancesRespondToSelector:sel]) {
+            Method m = class_getInstanceMethod(cls, sel);
+            IMP orig = method_getImplementation(m);
+            IMP new = imp_implementationWithBlock(^(id self, NSString *url){
+                ((void(*)(id,SEL,NSString*))orig)(self, sel, url);
+                if (isGoodImageURL(url)) [g_collector addURL:url from:@"AMImgInfo"];
+            });
+            method_setImplementation(m, new);
+            HHLog(@"✅ Hook AMImageURLInfo: %@", s);
+            return;
+        }
+    }
+}
+
+// ==================== 入口 ====================
 __attribute__((constructor))
-static void PDDEntry(void) {
+static void PDDSaverEntry(void) {
     @autoreleasepool {
-        HHLog(@"🚀 PDDSaver.dylib 已注入PDD");
-        HHLog(@"📱 BundleID: %@", [NSBundle mainBundle].bundleIdentifier);
+        HHLog(@"========================================");
+        HHLog(@"🚀 PDDSaver v2 已注入");
+        HHLog(@"   BundleID: %@", [NSBundle mainBundle].bundleIdentifier);
+        HHLog(@"   架构: %@", @(sizeof(void*))); // 8==arm64
+        HHLog(@"========================================");
         
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        g_collector = [[ImgCollector alloc] init];
+        
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             @autoreleasepool {
-                HHLog(@"🏗️ 开始安装Hooks...");
+                HHLog(@"");
+                HHLog(@"🏗️ [诊断] 安装所有Hooks...");
                 
-                // === 策略1: Hook SDWebImage ===
-                Class downloaderCls = objc_getClass("SDWebImageDownloader");
-                if (downloaderCls) {
-                    HHLog(@"✅ 检测到 SDWebImageDownloader");
-                    // downloadImageWithURL:options:context:
-                    // 实际方法可能是 downloadImageWithURL:options:progress:completed: 或 downloadImageWithURL:
-                    SEL sel1 = @selector(downloadImageWithURL:options:context:);
-                    SEL sel2 = @selector(downloadImageWithURL:options:progress:completed:);
-                    SEL sel3 = @selector(downloadImageWithURL:);
-                    
-                    SEL sels[] = {sel1, sel2, sel3};
-                    for (int si = 0; si < 3; si++) {
-                        if ([downloaderCls instancesRespondToSelector:sels[si]]) {
-                            HHLog(@"  Hook方法: %@", NSStringFromSelector(sels[si]));
-                            break;
-                        }
-                    }
-                }
+                // 策略1: UIImageView sd_setImageWithURL (最简单直接)
+                HHLog(@"");
+                HHLog(@"--- 策略1: UIImageView.sd_setImageWithURL ---");
+                hook_UIImageView_sd();
                 
-                // === 策略1b: Hook SDWebImageManager（更上层，更容易） ===
-                // loadImageWithURL:options:progress:completed:
-                Class managerCls = objc_getClass("SDWebImageManager");
-                SEL loadSel = @selector(loadImageWithURL:options:progress:completed:);
-                if (managerCls && [managerCls instancesRespondToSelector:loadSel]) {
-                    HHLog(@"  Hook SDWebImageManager.loadImageWithURL:");
-                    Method loadM = class_getInstanceMethod(managerCls, loadSel);
-                    IMP loadOrig = method_getImplementation(loadM);
-                    
-                    IMP loadNew = imp_implementationWithBlock(^(id _self, NSURL *url, NSInteger options, id progress, id completed) {
-                        if (url.absoluteString.length > 0) {
-                            NSString *s = url.absoluteString;
-                            if (([s containsString:@"pddpic.com"] || [s containsString:@"yangkeduo.com"]) &&
-                                [s rangeOfString:@"icon" options:NSCaseInsensitiveSearch].location == NSNotFound &&
-                                [s rangeOfString:@"avatar" options:NSCaseInsensitiveSearch].location == NSNotFound) {
-                                [[PDDSaverImageCollector shared] addImageURL:s title:@"SDWebImage"];
-                            }
-                        }
-                        ((void(*)(id,SEL,NSURL*,NSInteger,id,id))loadOrig)(_self, loadSel, url, options, progress, completed);
-                    });
-                    method_setImplementation(loadM, loadNew);
-                    HHLog(@"✅ SDWebImageManager Hook 安装成功");
-                } else {
-                    HHLog(@"⚠️ SDWebImageManager hook失败，类=%@" , managerCls);
-                }
+                // 策略2: NSURLRequest (拦截所有网络请求图片)
+                HHLog(@"");
+                HHLog(@"--- 策略2: NSURLRequest ---");
+                hook_NSURLRequest();
                 
-                // === 策略2: Hook GoodsImageModel ===
-                Class gimCls = objc_getClass("GoodsImageModel");
-                if (gimCls) {
-                    // 找setUrl: 或 setImage_url: 或 setThumb_url:
-                    SEL urlSel = nil;
-                    for (NSString *selName in @[@"setUrl:", @"setImage_url:", @"setImageUrl:", @"setThumb_url:", @"setImgUrl:", @"setThumbUrl:"]) {
-                        SEL s = NSSelectorFromString(selName);
-                        if ([gimCls instancesRespondToSelector:s]) {
-                            urlSel = s;
-                            break;
-                        }
-                    }
-                    if (urlSel) {
-                        Method m = class_getInstanceMethod(gimCls, urlSel);
-                        IMP orig = method_getImplementation(m);
-                        IMP new = imp_implementationWithBlock(^(id _self, NSString *_url){
-                            ((void(*)(id,SEL,NSString*))orig)(_self, urlSel, _url);
-                            if (_url && [_url containsString:@"pddpic"]) {
-                                [[PDDSaverImageCollector shared] addImageURL:_url title:@"GoodsImageModel"];
-                            }
-                        });
-                        method_setImplementation(m, new);
-                        HHLog(@"✅ GoodsImageModel.%@ Hook 安装成功", NSStringFromSelector(urlSel));
-                    } else {
-                        HHLog(@"⚠️ GoodsImageModel 存在但没有找到setUrl方法，打印属性:");
-                        tryScanGoodsModel();
-                    }
-                } else {
-                    HHLog(@"⚠️ GoodsImageModel 类不存在");
-                }
+                // 策略3: NSURLSession (兜底)
+                HHLog(@"");
+                HHLog(@"--- 策略3: NSURLSession ---");
+                hook_NSURLSession();
                 
-                // === 策略3: Hook PDDGoodsDetailPhotoController ===
-                Class photoCls = objc_getClass("PDDGoodsDetailPhotoController");
-                if (photoCls) {
-                    HHLog(@"✅ 检测到 PDDGoodsDetailPhotoController");
-                    // 找viewDidLoad或者展示图片的方法
-                    if ([photoCls instancesRespondToSelector:@selector(viewDidLoad)]) {
-                        SEL vdlSel = @selector(viewDidLoad);
-                        Method vdlM = class_getInstanceMethod(photoCls, vdlSel);
-                        IMP vdlOrig = method_getImplementation(vdlM);
-                        IMP vdlNew = imp_implementationWithBlock(^(id _self){
-                            ((void(*)(id,SEL))vdlOrig)(_self, vdlSel);
-                            HHLog(@"📷 商品详情图片页已加载");
-                        });
-                        method_setImplementation(vdlM, vdlNew);
-                        HHLog(@"✅ PDDGoodsDetailPhotoController.viewDidLoad Hook 安装成功");
-                    }
-                }
+                // 策略4: SDWebImageDownloader
+                HHLog(@"");
+                HHLog(@"--- 策略4: SDWebImageDownloader ---");
+                hook_SDWebImageDownloader();
                 
-                // === 安装悬浮窗 ===
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    UIWindow *key = nil;
-                    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-                        if (!w.hidden && w.isKeyWindow) { key = w; break; }
-                    }
-                    if (!key) key = [UIApplication sharedApplication].keyWindow;
-                    if (key) {
-                        // 创建悬浮窗容器
-                        CGFloat btnSize = 44.0;
-                        CGFloat screenW = key.bounds.size.width;
-                        CGFloat margin = 10.0;
-                        
-                        UIView *floatBtn = [[UIView alloc] initWithFrame:CGRectMake(screenW - btnSize - margin, 120, btnSize, btnSize)];
-                        floatBtn.backgroundColor = [[UIColor colorWithRed:0.98 green:0.31 blue:0.31 alpha:1.0] colorWithAlphaComponent:0.92];
-                        floatBtn.layer.cornerRadius = btnSize / 2;
-                        floatBtn.layer.shadowColor = [UIColor blackColor].CGColor;
-                        floatBtn.layer.shadowOffset = CGSizeMake(0, 2);
-                        floatBtn.layer.shadowOpacity = 0.3;
-                        floatBtn.layer.shadowRadius = 4;
-                        
-                        // 图标用文字
-                        UILabel *icon = [[UILabel alloc] initWithFrame:floatBtn.bounds];
-                        icon.text = @"📷";
-                        icon.font = [UIFont systemFontOfSize:20];
-                        icon.textAlignment = NSTextAlignmentCenter;
-                        [floatBtn addSubview:icon];
-                        
-                        // 拖拽手势
-                        __block CGPoint panStart;
-                        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:[NSNull null] action:nil];
-                        __weak UIView *weakBtn = floatBtn;
-                        __weak UIPanGestureRecognizer *weakPan = pan;
-                        // 用block实现拖拽
-                        IMP panBlock = imp_implementationWithBlock(^(id _self, UIPanGestureRecognizer *gesture){
-                            UIView *btn = weakBtn;
-                            if (!btn) return;
-                            CGPoint trans = [gesture translationInView:key];
-                            if (gesture.state == UIGestureRecognizerStateBegan) {
-                                panStart = btn.center;
-                            }
-                            btn.center = CGPointMake(panStart.x + trans.x, panStart.y + trans.y);
-                            if (gesture.state == UIGestureRecognizerStateEnded) {
-                                // 贴边
-                                [UIView animateWithDuration:0.2 animations:^{
-                                    CGFloat w = btn.frame.size.width / 2;
-                                    CGFloat cx = btn.center.x;
-                                    if (cx < key.bounds.size.width / 2) {
-                                        cx = w + margin;
-                                    } else {
-                                        cx = key.bounds.size.width - w - margin;
-                                    }
-                                    CGFloat cy = btn.center.y;
-                                    if (cy < 80) cy = 80 + w;
-                                    if (cy > key.bounds.size.height - 160) cy = key.bounds.size.height - 160 - w;
-                                    btn.center = CGPointMake(cx, cy);
-                                }];
-                            }
-                        });
-                        class_addMethod([floatBtn class], @selector(handlePan:), panBlock, "v@:@");
-                        [pan addTarget:floatBtn action:@selector(handlePan:)];
-                        [floatBtn addGestureRecognizer:pan];
-                        
-                        // 点击手势
-                        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:[NSNull null] action:nil];
-                        IMP tapBlock = imp_implementationWithBlock(^(id _self, UITapGestureRecognizer *gesture){
-                            showMenu(floatBtn);
-                        });
-                        class_addMethod([floatBtn class], @selector(handleTap:), tapBlock, "v@:@");
-                        [tap addTarget:floatBtn action:@selector(handleTap:)];
-                        [floatBtn addGestureRecognizer:tap];
-                        
-                        // 计数器label
-                        UILabel *badge = [[UILabel alloc] initWithFrame:CGRectMake(btnSize - 15, -3, 18, 18)];
-                        badge.backgroundColor = [UIColor whiteColor];
-                        badge.textColor = [UIColor colorWithRed:0.98 green:0.31 blue:0.31 alpha:1.0];
-                        badge.font = [UIFont systemFontOfSize:10 weight:UIFontWeightBold];
-                        badge.textAlignment = NSTextAlignmentCenter;
-                        badge.layer.cornerRadius = 9;
-                        badge.layer.masksToBounds = YES;
-                        badge.tag = 999;
-                        badge.hidden = YES;
-                        [floatBtn addSubview:badge];
-                        
-                        [key addSubview:floatBtn];
-                        HHLog(@"✅ 悬浮窗已安装到 %@", key);
-                        
-                        // 定时刷新badge数字
-                        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                            while (1) {
-                                dispatch_async(dispatch_get_main_queue(), ^{
-                                    NSInteger c = [[PDDSaverImageCollector shared] allImages].count;
-                                    if (c > 0) {
-                                        badge.hidden = NO;
-                                        badge.text = [NSString stringWithFormat:@"%ld", (long)MIN(c, 99)];
-                                    } else {
-                                        badge.hidden = YES;
-                                    }
-                                });
-                                [NSThread sleepForTimeInterval:2.0];
-                            }
-                        });
-                    }
-                });
+                // 策略5: SDWebImageManager
+                HHLog(@"");
+                HHLog(@"--- 策略5: SDWebImageManager ---");
+                hook_SDWebImageManager();
                 
+                // 策略6: GoodsImageModel (精准)
+                HHLog(@"");
+                HHLog(@"--- 策略6: GoodsImageModel ---");
+                hook_GoodsImageModel();
+                
+                // 策略7: AMImageURLInfo
+                HHLog(@"");
+                HHLog(@"--- 策略7: AMImageURLInfo ---");
+                hook_AMImageURLInfo();
+                
+                HHLog(@"");
+                HHLog(@"========================================");
                 HHLog(@"🏁 所有Hook安装完成");
+                HHLog(@"========================================");
+                
+                // 显示浮窗
+                [FloatBall showWithCollector:g_collector];
             }
         });
     }
