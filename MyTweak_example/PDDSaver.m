@@ -186,14 +186,12 @@ static BOOL isGoodImageURL(NSString *s) {
 static ImgCollector *g_collector = nil;
 
 // ---- Hook 1: SDWebImageManager (新版5.x API) ----
+typedef void (*SDWebHookFn)(id, SEL, NSURL *, void *, void *, id, id);
 static void hook_SDWebImageManager(void) {
     Class cls = objc_getClass("SDWebImageManager");
     if (!cls) { HHLog(@"⚠️ SDWebImageManager 类不存在"); return; }
     HHLog(@"✅ 找到 SDWebImageManager");
 
-    // 新版SDWebImage API: 
-    // loadImageWithURL:options:context:progress:completed:
-    // loadImageWithURL:options:progress:completed:
     SEL sels[] = {
         @selector(loadImageWithURL:options:context:progress:completed:),
         @selector(loadImageWithURL:options:progress:completed:),
@@ -203,27 +201,14 @@ static void hook_SDWebImageManager(void) {
     for (int i = 0; i < 3; i++) {
         Method m = class_getInstanceMethod(cls, sels[i]);
         if (m) {
+            SEL capturedSel = sels[i];
             IMP orig = method_getImplementation(m);
-            IMP new = imp_implementationWithBlock(^(id self, NSURL *url, ...) {
-                // 只拦截url参数来记录，不干扰原始逻辑
+            IMP new = imp_implementationWithBlock(^(id self, NSURL *url, void *a2, void *a3, id a4, id a5) {
                 if (url && [url isKindOfClass:[NSURL class]]) {
                     NSString *s = url.absoluteString;
                     if (isGoodImageURL(s)) [g_collector addURL:s from:@"SDWebMgr"];
                 }
-                
-                // 转发到原始实现
-                // 用va_list处理可变参数
-                va_list args;
-                va_start(args, url);
-                void *arg2 = va_arg(args, void *);
-                void *arg3 = va_arg(args, void *);
-                id arg4 = va_arg(args, id);
-                id arg5 = va_arg(args, id);
-                va_end(args);
-                
-                // 根据原始方法签名调用
-                typedef void (*fn5)(id, SEL, NSURL *, void *, void *, id, id);
-                ((fn5)orig)(self, sels[i], url, arg2, arg3, arg4, arg5);
+                ((SDWebHookFn)orig)(self, capturedSel, url, a2, a3, a4, a5);
             });
             method_setImplementation(m, new);
             HHLog(@"✅ Hook SDWebImageManager: %@", NSStringFromSelector(sels[i]));
@@ -281,6 +266,7 @@ static void hook_NSURLRequest(void) {
 }
 
 // ---- Hook 4: SDWebImageDownloader ----
+typedef void (*SDDownloadHookFn)(id, SEL, NSURL *, void *, void *, id, id);
 static void hook_SDWebImageDownloader(void) {
     Class cls = objc_getClass("SDWebImageDownloader");
     if (!cls) { HHLog(@"⚠️ SDWebImageDownloader 不存在"); return; }
@@ -294,17 +280,14 @@ static void hook_SDWebImageDownloader(void) {
     for (int i = 0; i < 3; i++) {
         Method m = class_getInstanceMethod(cls, sels[i]);
         if (m) {
+            SEL capturedSel = sels[i];
             IMP orig = method_getImplementation(m);
-            IMP new = imp_implementationWithBlock(^(id self, NSURL *url, ...) {
+            IMP new = imp_implementationWithBlock(^(id self, NSURL *url, void *a2, void *a3, id a4, id a5) {
                 if (url && [url isKindOfClass:[NSURL class]]) {
                     NSString *s = url.absoluteString;
                     if (isGoodImageURL(s)) [g_collector addURL:s from:@"SDDownload"];
                 }
-                va_list args; va_start(args, url);
-                void *a2 = va_arg(args, void *); void *a3 = va_arg(args, void *);
-                id a4 = va_arg(args, id); id a5 = va_arg(args, id); va_end(args);
-                typedef void (*fn)(id, SEL, NSURL *, void *, void *, id, id);
-                ((fn)orig)(self, sels[i], url, a2, a3, a4, a5);
+                ((SDDownloadHookFn)orig)(self, capturedSel, url, a2, a3, a4, a5);
             });
             method_setImplementation(m, new);
             HHLog(@"✅ Hook SDWebImageDownloader: %@", NSStringFromSelector(sels[i]));
