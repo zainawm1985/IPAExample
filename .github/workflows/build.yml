@@ -40,8 +40,8 @@ on:
     types: [published]
 
 env:
-  TWEAK_NAME: MyTweak
-  SRC_FILE: MyTweak_example/MyTweak.m
+  TWEAK_NAME: PDDSaver
+  SRC_FILE: MyTweak_example/PDDSaver.m
   FRAMEWORKS: "-framework Foundation -framework UIKit -framework QuartzCore"
 
 # ============================================================
