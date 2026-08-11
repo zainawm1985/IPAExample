@@ -43,14 +43,24 @@
     if (self = [super initWithFrame:f]) {
         self.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.97];
         self.entry = entry;
+        
+        // 避让刘海/状态栏
+        CGFloat safeTop = 44;
+        if (@available(iOS 11.0, *)) {
+            UIWindow *kw = [UIApplication sharedApplication].keyWindow;
+            if (!kw) kw = [UIApplication sharedApplication].windows.firstObject;
+            safeTop = kw.safeAreaInsets.top > 0 ? kw.safeAreaInsets.top : 44;
+        }
+        
         _seg = [[UISegmentedControl alloc] initWithItems:@[@"响应", @"请求体", @"URL"]];
         _seg.selectedSegmentIndex = 0;
-        _seg.frame = CGRectMake(12, 50, f.size.width-24, 32);
+        _seg.frame = CGRectMake(12, safeTop + 50, f.size.width-24, 32);
         _seg.tintColor = [UIColor colorWithRed:0.3 green:0.7 blue:1 alpha:1];
         [_seg addTarget:self action:@selector(switchTab) forControlEvents:UIControlEventValueChanged];
         [self addSubview:_seg];
         
-        _textView = [[UITextView alloc] initWithFrame:CGRectMake(8, 90, f.size.width-16, f.size.height-150)];
+        CGFloat textTop = safeTop + 90;
+        _textView = [[UITextView alloc] initWithFrame:CGRectMake(8, textTop, f.size.width-16, f.size.height - textTop - 60)];
         _textView.backgroundColor = [UIColor colorWithWhite:0.06 alpha:1];
         _textView.textColor = [UIColor colorWithWhite:0.9 alpha:1];
         _textView.font = [UIFont fontWithName:@"Menlo" size:11] ?: [UIFont systemFontOfSize:11];
@@ -62,7 +72,7 @@
         
         // 关闭按钮
         UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
-        close.frame = CGRectMake(f.size.width - 60, 8, 50, 40);
+        close.frame = CGRectMake(f.size.width - 60, safeTop + 5, 50, 40);
         [close setTitle:@"✕ 关闭" forState:UIControlStateNormal];
         [close setTitleColor:[UIColor colorWithRed:1 green:0.4 blue:0.4 alpha:1] forState:UIControlStateNormal];
         close.titleLabel.font = [UIFont boldSystemFontOfSize:14];
@@ -71,7 +81,7 @@
         
         // 复制按钮
         UIButton *copy = [UIButton buttonWithType:UIButtonTypeSystem];
-        copy.frame = CGRectMake(12, 8, 60, 40);
+        copy.frame = CGRectMake(12, safeTop + 5, 80, 40);
         [copy setTitle:@"📋复制" forState:UIControlStateNormal];
         [copy setTitleColor:[UIColor colorWithRed:0.3 green:0.7 blue:1 alpha:1] forState:UIControlStateNormal];
         copy.titleLabel.font = [UIFont boldSystemFontOfSize:13];
@@ -79,7 +89,7 @@
         [self addSubview:copy];
         
         // 请求摘要
-        UILabel *summary = [[UILabel alloc] initWithFrame:CGRectMake(80, 10, f.size.width-150, 38)];
+        UILabel *summary = [[UILabel alloc] initWithFrame:CGRectMake(90, safeTop + 6, f.size.width-160, 38)];
         summary.text = [NSString stringWithFormat:@"%@@%ld  %ldB", entry.method, (long)entry.statusCode, (long)entry.bodySize];
         summary.textColor = [UIColor colorWithWhite:0.6 alpha:1];
         summary.font = [UIFont systemFontOfSize:11];
