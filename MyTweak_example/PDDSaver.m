@@ -1,460 +1,390 @@
 //
-//  PDDSaver.m  v2
-//  浮窗实时显示 + 多层兜底Hook
+//  PDDSaver.m  v4 - 实时网络面板 (类似浏览器开发者工具)
 //
 
 #import <UIKit/UIKit.h>
-#import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
-#include <dlfcn.h>
 
-#define HHLog(fmt, ...) NSLog(@"[PDDSaver] " fmt, ##__VA_ARGS__)
+#define HHLog(fmt, ...) NSLog(@"[PDDNet] " fmt, ##__VA_ARGS__)
 
-// ==================== 图片收集器 ====================
-@interface ImgCollector : NSObject
-@property (nonatomic, copy) void(^onCountChanged)(NSInteger count);
-- (void)addURL:(NSString *)url from:(NSString *)source;
-- (NSArray<NSString *> *)allURLs;
+// ==================== 单条请求记录 ====================
+@interface NetEntry : NSObject
+@property (nonatomic, copy) NSString *url;
+@property (nonatomic, copy) NSString *method;
+@property (nonatomic, assign) NSInteger statusCode;
+@property (nonatomic, assign) NSInteger bodySize;
+@property (nonatomic, copy) NSString *preview;
+@property (nonatomic, copy) NSString *time;
+@end
+@implementation NetEntry
+@end
+
+// ==================== 网络面板 (底部抽屉) ====================
+@interface NetPanel : UIView <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, strong) NSMutableArray<NetEntry *> *entries;
+@property (nonatomic, strong) UILabel *countLabel;
+@property (nonatomic, strong) UILabel *urlLabel;
+@property (nonatomic, assign) BOOL expanded;
++ (instancetype)shared;
+- (void)show;
+- (void)hide;
+- (void)toggle;
+- (void)addEntry:(NetEntry *)entry;
 - (void)clear;
-- (NSInteger)count;
 @end
 
-@implementation ImgCollector {
-    NSMutableArray<NSString *> *_urls;
-    NSMutableSet<NSString *> *_seen;
-}
-- (instancetype)init { self = [super init]; _urls = [NSMutableArray new]; _seen = [NSMutableSet new]; return self; }
-- (void)addURL:(NSString *)url from:(NSString *)source {
-    if (!url.length) return;
-    @synchronized(_seen) {
-        if ([_seen containsObject:url]) return;
-        [_seen addObject:url];
-    }
-    @synchronized(_urls) { [_urls addObject:url]; }
-    HHLog(@"📷 +1 [%lu] src=%@ url=%@", (unsigned long)_seen.count, source, url);
-    if (self.onCountChanged) dispatch_async(dispatch_get_main_queue(), ^{ self.onCountChanged(self.count); });
-}
-- (NSArray<NSString *> *)allURLs { @synchronized(_urls) { return _urls.copy; } }
-- (void)clear { @synchronized(_urls) { [_urls removeAllObjects]; } @synchronized(_seen) { [_seen removeAllObjects]; } }
-- (NSInteger)count { @synchronized(_seen) { return _seen.count; } }
-@end
+@implementation NetPanel
 
-// ==================== 悬浮窗 ====================
-@interface FloatBall : UIButton
-@property (nonatomic, strong) ImgCollector *collector;
-+ (void)showWithCollector:(ImgCollector *)c;
-@end
-
-@implementation FloatBall {
-    CGPoint _startPoint;
-    UILabel *_badge;
++ (instancetype)shared {
+    static NetPanel *inst;
+    static dispatch_once_t t;
+    dispatch_once(&t, ^{ inst = [[NetPanel alloc] init]; });
+    return inst;
 }
 
-+ (void)showWithCollector:(ImgCollector *)c {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        FloatBall *ball = [[FloatBall alloc] initWithFrame:CGRectMake(10, 200, 56, 56)];
-        ball.collector = c;
-        UIWindow *kw = [UIApplication sharedApplication].keyWindow;
-        if (!kw) kw = [UIApplication sharedApplication].windows.lastObject;
-        [kw addSubview:ball];
-        c.onCountChanged = ^(NSInteger n) { [ball updateBadge:n]; };
-        HHLog(@"🟢 悬浮窗已显示");
-    });
-}
-
-- (instancetype)initWithFrame:(CGRect)frame {
+- (instancetype)init {
+    CGFloat h = UIScreen.mainScreen.bounds.size.height;
+    CGFloat w = UIScreen.mainScreen.bounds.size.width;
+    CGRect frame = CGRectMake(0, h - 320, w, 320);
     if (self = [super initWithFrame:frame]) {
-        self.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.75];
-        self.layer.cornerRadius = 28;
-        self.layer.borderColor = [UIColor whiteColor].CGColor;
-        self.layer.borderWidth = 2;
-        self.layer.shadowColor = [UIColor blackColor].CGColor;
-        self.layer.shadowOffset = CGSizeMake(0, 2);
-        self.layer.shadowRadius = 4;
-        self.layer.shadowOpacity = 0.4;
-        self.clipsToBounds = NO;
+        self.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.95];
+        self.layer.cornerRadius = 12;
+        self.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+        self.layer.shadowColor = UIColor.blackColor.CGColor;
+        self.layer.shadowOffset = CGSizeMake(0, -2);
+        self.layer.shadowRadius = 8;
+        self.layer.shadowOpacity = 0.5;
+        self.entries = [NSMutableArray array];
         
-        _badge = [[UILabel alloc] initWithFrame:CGRectMake(-6, -6, 24, 24)];
-        _badge.backgroundColor = [UIColor systemRedColor];
-        _badge.textColor = [UIColor whiteColor];
-        _badge.font = [UIFont boldSystemFontOfSize:11];
-        _badge.textAlignment = NSTextAlignmentCenter;
-        _badge.layer.cornerRadius = 12;
-        _badge.clipsToBounds = YES;
-        _badge.text = @"0";
-        [self addSubview:_badge];
+        // 顶部栏
+        UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 40)];
+        header.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1];
         
-        UILabel *icon = [[UILabel alloc] initWithFrame:CGRectMake(8, 6, 40, 24)];
-        icon.text = @"📷";
-        icon.font = [UIFont systemFontOfSize:18];
-        icon.textAlignment = NSTextAlignmentCenter;
-        [self addSubview:icon];
+        // 折叠按钮
+        UIButton *foldBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        foldBtn.frame = CGRectMake(8, 4, 36, 32);
+        [foldBtn setTitle:@"❮" forState:UIControlStateNormal];
+        foldBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+        foldBtn.tintColor = [UIColor colorWithRed:0.3 green:0.7 blue:1 alpha:1];
+        [foldBtn addTarget:self action:@selector(toggleFold) forControlEvents:UIControlEventTouchUpInside];
+        [header addSubview:foldBtn];
         
-        [self addTarget:self action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)];
-        [self addGestureRecognizer:pan];
+        // 标题
+        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(50, 0, 60, 40)];
+        title.text = @"📡 网络";
+        title.textColor = UIColor.whiteColor;
+        title.font = [UIFont boldSystemFontOfSize:13];
+        [header addSubview:title];
+        
+        // 计数
+        _countLabel = [[UILabel alloc] initWithFrame:CGRectMake(105, 0, 80, 40)];
+        _countLabel.text = @"0条";
+        _countLabel.textColor = [UIColor colorWithRed:0.3 green:0.7 blue:1 alpha:1];
+        _countLabel.font = [UIFont systemFontOfSize:12];
+        [header addSubview:_countLabel];
+        
+        // 清空按钮
+        UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        clearBtn.frame = CGRectMake(w - 80, 4, 36, 32);
+        [clearBtn setTitle:@"🗑" forState:UIControlStateNormal];
+        [clearBtn addTarget:self action:@selector(clearTap) forControlEvents:UIControlEventTouchUpInside];
+        [header addSubview:clearBtn];
+        
+        // 复制按钮
+        UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        copyBtn.frame = CGRectMake(w - 45, 4, 36, 32);
+        [copyBtn setTitle:@"📋" forState:UIControlStateNormal];
+        [copyBtn addTarget:self action:@selector(copyTap) forControlEvents:UIControlEventTouchUpInside];
+        [header addSubview:copyBtn];
+        
+        [self addSubview:header];
+        
+        // URL 预览标签
+        _urlLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 44, w-16, 28)];
+        _urlLabel.text = @"点击请求行查看详情";
+        _urlLabel.textColor = [UIColor colorWithWhite:0.5 alpha:1];
+        _urlLabel.font = [UIFont systemFontOfSize:10];
+        _urlLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        [self addSubview:_urlLabel];
+        
+        // 表格
+        _tableView = [[UITableView alloc] initWithFrame:CGRectMake(0, 72, w, 248) style:UITableViewStylePlain];
+        _tableView.backgroundColor = UIColor.clearColor;
+        _tableView.separatorColor = [UIColor colorWithWhite:0.25 alpha:1];
+        _tableView.dataSource = self;
+        _tableView.delegate = self;
+        _tableView.rowHeight = 36;
+        [_tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"c"];
+        [self addSubview:_tableView];
+        
+        // 拖动手柄
+        UIView *handle = [[UIView alloc] initWithFrame:CGRectMake(w/2-18, 6, 36, 4)];
+        handle.backgroundColor = [UIColor colorWithWhite:0.4 alpha:1];
+        handle.layer.cornerRadius = 2;
+        [self addSubview:handle];
+        
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(panHeader:)];
+        [header addGestureRecognizer:pan];
+        
+        self.hidden = YES;
     }
     return self;
 }
 
-- (void)updateBadge:(NSInteger)n {
-    _badge.text = [NSString stringWithFormat:@"%ld", (long)n];
-    if (n > 0) _badge.backgroundColor = [UIColor systemGreenColor];
-    else _badge.backgroundColor = [UIColor systemRedColor];
-}
-
-- (void)drag:(UIPanGestureRecognizer *)g {
-    UIView *v = g.view;
-    if (g.state == UIGestureRecognizerStateBegan) _startPoint = v.center;
-    CGPoint t = [g translationInView:v.superview];
-    v.center = CGPointMake(_startPoint.x + t.x, _startPoint.y + t.y);
-    if (g.state == UIGestureRecognizerStateEnded) {
-        CGFloat x = v.center.x, w = v.superview.bounds.size.width;
-        v.center = CGPointMake(x < w/2 ? 38 : w-38, MAX(100, MIN(v.center.y, v.superview.bounds.size.height-100)));
-    }
-}
-
-- (void)tap {
-    NSArray *urls = [self.collector allURLs];
-    NSInteger n = urls.count;
-    
-    // 找当前VC
-    UIResponder *r = self;
-    while (r && ![r isKindOfClass:[UIViewController class]]) r = [r nextResponder];
-    UIViewController *vc = (UIViewController *)r;
-    if (!vc) {
+- (void)show {
+    if (!self.superview) {
         UIWindow *kw = [UIApplication sharedApplication].keyWindow;
-        vc = kw.rootViewController;
-        while (vc.presentedViewController) vc = vc.presentedViewController;
+        if (!kw) kw = [UIApplication sharedApplication].windows.firstObject;
+        [kw addSubview:self];
     }
-    
-    NSString *msg = n > 0 ? [NSString stringWithFormat:@"已捕获 %ld 张图片\n点复制后粘贴到电脑即可", (long)n] : @"尚未捕获到商品图片\n请浏览商品页试试";
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"📷 PDD图片提取"
-                                                                 message:msg
-                                                          preferredStyle:UIAlertControllerStyleActionSheet];
-    if (n > 0) {
-        [ac addAction:[UIAlertAction actionWithTitle:@"📋 复制全部URL" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
-            NSString *txt = @"";
-            for (NSString *u in urls) txt = [txt stringByAppendingFormat:@"%@\n", u];
-            [UIPasteboard generalPasteboard].string = txt;
-            [self toast:[NSString stringWithFormat:@"已复制 %ld 个URL", (long)n] inView:vc.view];
-        }]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"🗑️ 清空" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
-            [self.collector clear];
-            [self updateBadge:0];
-            [self toast:@"已清空" inView:vc.view];
-        }]];
-    }
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [vc presentViewController:ac animated:YES completion:nil];
+    self.hidden = NO;
+    [self.superview bringSubviewToFront:self];
 }
 
-- (void)toast:(NSString *)t inView:(UIView *)v {
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(0,0,220,40)];
-    l.text = t; l.textColor = UIColor.whiteColor; l.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.85];
-    l.textAlignment = NSTextAlignmentCenter; l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-    l.layer.cornerRadius = 8; l.clipsToBounds = YES;
-    l.center = CGPointMake(v.bounds.size.width/2, v.bounds.size.height*0.55);
-    l.alpha = 0; [v addSubview:l];
-    [UIView animateWithDuration:0.25 animations:^{ l.alpha = 1; }];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2*NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        [UIView animateWithDuration:0.25 animations:^{ l.alpha = 0; } completion:^(BOOL f){ [l removeFromSuperview]; }];
+- (void)hide { self.hidden = YES; }
+
+- (void)toggle {
+    if (self.hidden) [self show]; else [self hide];
+}
+
+- (void)toggleFold {
+    _expanded = !_expanded;
+    CGFloat h = _expanded ? 44 : 320;
+    CGFloat sh = UIScreen.mainScreen.bounds.size.height;
+    CGFloat w = UIScreen.mainScreen.bounds.size.width;
+    [UIView animateWithDuration:0.25 animations:^{
+        self.frame = CGRectMake(0, sh - h, w, 320);
+    }];
+}
+
+- (void)panHeader:(UIPanGestureRecognizer *)g {
+    CGPoint t = [g translationInView:self.superview];
+    CGFloat sh = UIScreen.mainScreen.bounds.size.height;
+    CGFloat w = UIScreen.mainScreen.bounds.size.width;
+    self.frame = CGRectMake(0, MAX(60, self.frame.origin.y + t.y), w, 320);
+    [g setTranslation:CGPointZero inView:self.superview];
+    if (g.state == UIGestureRecognizerStateEnded) {
+        CGFloat mid = sh - 180;
+        CGFloat target = self.frame.origin.y < mid ? 60 : sh - 320;
+        [UIView animateWithDuration:0.2 animations:^{
+            self.frame = CGRectMake(0, target, w, 320);
+        }];
+    }
+}
+
+- (void)addEntry:(NetEntry *)entry {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self.entries insertObject:entry atIndex:0];
+        if (self.entries.count > 200) [self.entries removeLastObject];
+        self.countLabel.text = [NSString stringWithFormat:@"%lu条", (unsigned long)self.entries.count];
+        HHLog(@"[%@@%ld %ldB] %@", entry.method, (long)entry.statusCode, (long)entry.bodySize, entry.url);
+        [self.tableView reloadData];
     });
 }
+
+- (void)clearTap {
+    [self.entries removeAllObjects];
+    self.countLabel.text = @"0条";
+    self.urlLabel.text = @"点击请求行查看详情";
+    [self.tableView reloadData];
+}
+
+- (void)clear { [self clearTap]; }
+
+- (void)copyTap {
+    NSMutableString *s = [NSMutableString string];
+    for (NetEntry *e in self.entries) {
+        [s appendFormat:@"[%@@%ld %ldB] %@\n", e.method, (long)e.statusCode, (long)e.bodySize, e.url];
+    }
+    [UIPasteboard generalPasteboard].string = s;
+    [self flashToast:[NSString stringWithFormat:@"已复制%lu条", (unsigned long)self.entries.count]];
+}
+
+- (void)flashToast:(NSString *)txt {
+    UILabel *l = [[UILabel alloc] init];
+    l.text = txt;
+    l.textColor = UIColor.whiteColor;
+    l.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.8];
+    l.textAlignment = NSTextAlignmentCenter;
+    l.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    l.layer.cornerRadius = 6; l.clipsToBounds = YES;
+    [l sizeToFit];
+    l.frame = CGRectMake(0, 0, l.frame.size.width+16, 30);
+    l.center = CGPointMake(self.bounds.size.width/2, self.bounds.size.height/2);
+    l.alpha = 0;
+    [self addSubview:l];
+    [UIView animateWithDuration:0.2 animations:^{ l.alpha = 1; }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1.5*NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        [UIView animateWithDuration:0.2 animations:^{ l.alpha = 0; } completion:^(BOOL f){ [l removeFromSuperview]; }];
+    });
+}
+
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return self.entries.count; }
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:@"c"];
+    NetEntry *e = self.entries[ip.row];
+    
+    UIColor *sc; NSString *scTxt;
+    if (e.statusCode == 0) { sc = UIColor.grayColor; scTxt = @"···"; }
+    else if (e.statusCode < 300) { sc = UIColor.greenColor; scTxt = [NSString stringWithFormat:@"%ld",(long)e.statusCode]; }
+    else if (e.statusCode < 400) { sc = UIColor.yellowColor; scTxt = [NSString stringWithFormat:@"%ld",(long)e.statusCode]; }
+    else { sc = UIColor.redColor; scTxt = [NSString stringWithFormat:@"%ld",(long)e.statusCode]; }
+    
+    UIColor *mc;
+    if ([e.method isEqualToString:@"GET"])     mc = [UIColor colorWithRed:0.2 green:0.7 blue:0.3 alpha:1];
+    else if ([e.method isEqualToString:@"POST"])    mc = [UIColor colorWithRed:0.9 green:0.6 blue:0.1 alpha:1];
+    else if ([e.method isEqualToString:@"PUT"])     mc = [UIColor colorWithRed:0.3 green:0.5 blue:0.9 alpha:1];
+    else if ([e.method isEqualToString:@"DELETE"])  mc = UIColor.redColor;
+    else mc = UIColor.grayColor;
+    
+    NSString *shortURL = e.url;
+    if (shortURL.length > 55) shortURL = [[shortURL substringToIndex:52] stringByAppendingString:@"..."];
+    
+    NSString *sz = e.bodySize > 1024 ? [NSString stringWithFormat:@"%.1fK", e.bodySize/1024.0]
+                 : [NSString stringWithFormat:@"%ldB", (long)e.bodySize];
+    
+    NSMutableAttributedString *as = [[NSMutableAttributedString alloc] init];
+    [as appendAttributedString:[[NSAttributedString alloc] initWithString:e.method attributes:@{NSForegroundColorAttributeName:mc, NSFontAttributeName:[UIFont boldSystemFontOfSize:11]}]];
+    [as appendAttributedString:[[NSAttributedString alloc] initWithString:@"  " attributes:nil]];
+    [as appendAttributedString:[[NSAttributedString alloc] initWithString:scTxt attributes:@{NSForegroundColorAttributeName:sc, NSFontAttributeName:[UIFont boldSystemFontOfSize:11]}]];
+    [as appendAttributedString:[[NSAttributedString alloc] initWithString:@"  " attributes:nil]];
+    [as appendAttributedString:[[NSAttributedString alloc] initWithString:shortURL attributes:@{NSForegroundColorAttributeName:[UIColor colorWithWhite:0.85 alpha:1], NSFontAttributeName:[UIFont systemFontOfSize:11]}]];
+    [as appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"  %@", sz] attributes:@{NSForegroundColorAttributeName:[UIColor colorWithWhite:0.5 alpha:1], NSFontAttributeName:[UIFont systemFontOfSize:10]}]];
+    
+    c.textLabel.attributedText = as;
+    c.textLabel.numberOfLines = 1;
+    c.textLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    c.backgroundColor = ip.row % 2 == 0 ? [UIColor colorWithWhite:0.14 alpha:1] : [UIColor colorWithWhite:0.1 alpha:1];
+    c.selectionStyle = UITableViewCellSelectionStyleGray;
+    
+    return c;
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    NetEntry *e = self.entries[ip.row];
+    self.urlLabel.text = e.url;
+    self.urlLabel.textColor = [UIColor colorWithRed:0.4 green:0.7 blue:1 alpha:1];
+    [UIPasteboard generalPasteboard].string = e.url;
+    [self flashToast:@"URL已复制"];
+}
+
 @end
 
-// ==================== 图片URL过滤 ====================
-static BOOL isGoodImageURL(NSString *s) {
-    if (!s || s.length < 5) return NO;
-    // 只保留PDD图片域名
-    if (![s containsString:@"pddpic.com"] &&
-        ![s containsString:@"yangkeduo.com"] &&
-        ![s containsString:@"pddcdn.com"]) return NO;
-    // 排除UI图
-    s = [s lowercaseString];
-    if ([s containsString:@"icon"] || [s containsString:@"avatar"] || [s containsString:@"arrow"] ||
-        [s containsString:@"badge"] || [s containsString:@"button"] || [s containsString:@"navi"] ||
-        [s containsString:@"tab"] || [s containsString:@"back"] || [s containsString:@"close"] ||
-        [s containsString:@"logo"] || [s containsString:@"loading"] || [s containsString:@"placeholder"] ||
-        [s containsString:@"empty"]) return NO;
-    return YES;
+// ==================== 浮球 ====================
+@interface FloatBall : UIButton @end
+
+@implementation FloatBall { CGPoint _start; }
+
++ (void)show {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        FloatBall *b = [[FloatBall alloc] initWithFrame:CGRectMake(UIScreen.mainScreen.bounds.size.width - 56, 200, 48, 48)];
+        b.backgroundColor = [[UIColor colorWithRed:0.2 green:0.5 blue:0.9 alpha:1] colorWithAlphaComponent:0.85];
+        b.layer.cornerRadius = 24;
+        b.layer.borderColor = UIColor.whiteColor.CGColor;
+        b.layer.borderWidth = 1.5;
+        b.layer.shadowColor = UIColor.blackColor.CGColor;
+        b.layer.shadowOffset = CGSizeMake(0,2);
+        b.layer.shadowRadius = 4;
+        b.layer.shadowOpacity = 0.4;
+        b.clipsToBounds = NO;
+        
+        UILabel *icon = [[UILabel alloc] initWithFrame:CGRectMake(0, 2, 48, 44)];
+        icon.text = @"📡"; icon.font = [UIFont systemFontOfSize:18]; icon.textAlignment = NSTextAlignmentCenter;
+        [b addSubview:icon];
+        
+        [b addTarget:b action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:b action:@selector(drag:)];
+        [b addGestureRecognizer:pan];
+        
+        UIWindow *kw = [UIApplication sharedApplication].keyWindow;
+        if (!kw) kw = [UIApplication sharedApplication].windows.firstObject;
+        [kw addSubview:b];
+    });
 }
 
-// ==================== Hook逻辑 ====================
+- (void)tap { [[NetPanel shared] toggle]; }
 
-static ImgCollector *g_collector = nil;
+- (void)drag:(UIPanGestureRecognizer *)g {
+    if (g.state == UIGestureRecognizerStateBegan) _start = g.view.center;
+    CGPoint t = [g translationInView:g.view.superview];
+    g.view.center = CGPointMake(_start.x+t.x, _start.y+t.y);
+    if (g.state == UIGestureRecognizerStateEnded) {
+        CGFloat x = g.view.center.x, w = g.view.superview.bounds.size.width;
+        [UIView animateWithDuration:0.2 animations:^{ g.view.center = CGPointMake(x<w/2?34:w-34, g.view.center.y); }];
+    }
+}
 
-// ---- Hook 1: SDWebImageManager (新版5.x API) ----
-typedef void (*SDWebHookFn)(id, SEL, NSURL *, void *, void *, id, id);
-static void hook_SDWebImageManager(void) {
-    Class cls = objc_getClass("SDWebImageManager");
-    if (!cls) { HHLog(@"⚠️ SDWebImageManager 类不存在"); return; }
-    HHLog(@"✅ 找到 SDWebImageManager");
+@end
 
-    SEL sels[] = {
-        @selector(loadImageWithURL:options:context:progress:completed:),
-        @selector(loadImageWithURL:options:progress:completed:),
-        @selector(loadImageWithURL:progress:completed:),
+// ==================== NSURLSession Hook ====================
+
+static NSString *safePreview(NSData *data, NSUInteger maxLen) {
+    if (!data || data.length == 0) return @"";
+    NSUInteger len = MIN(data.length, maxLen);
+    NSString *s = [[NSString alloc] initWithData:[data subdataWithRange:NSMakeRange(0, len)] encoding:NSUTF8StringEncoding];
+    if (!s) s = [[NSString alloc] initWithData:[data subdataWithRange:NSMakeRange(0, len)] encoding:NSASCIIStringEncoding];
+    if (!s) s = [NSString stringWithFormat:@"(binary %luB)", (unsigned long)data.length];
+    s = [s stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    s = [s stringByReplacingOccurrencesOfString:@"\r" withString:@""];
+    if (data.length > maxLen) s = [s stringByAppendingString:@"..."];
+    return s;
+}
+
+typedef NSURLSessionDataTask *(*DataTaskWithReqFn)(id, SEL, NSURLRequest *, void(^)(NSData *, NSURLResponse *, NSError *));
+static DataTaskWithReqFn _origDataTaskWithReq = NULL;
+
+static NSURLSessionDataTask *_hookDataTaskWithReq(id self, SEL _cmd, NSURLRequest *req, void(^handler)(NSData *, NSURLResponse *, NSError *)) {
+    NSURL *url = req.URL;
+    NSString *method = req.HTTPMethod ?: @"GET";
+    id handlerCopy = [handler copy];
+    void(^wrapped)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *resp, NSError *err) {
+        NSInteger status = 0;
+        if ([resp isKindOfClass:[NSHTTPURLResponse class]]) status = ((NSHTTPURLResponse *)resp).statusCode;
+        NetEntry *e = [NetEntry new];
+        e.url = url.absoluteString; e.method = method; e.statusCode = status; e.bodySize = data.length;
+        e.preview = safePreview(data, 150);
+        [[NetPanel shared] addEntry:e];
+        if (handlerCopy) ((void(^)(NSData *, NSURLResponse *, NSError *))handlerCopy)(data, resp, err);
     };
-    
-    for (int i = 0; i < 3; i++) {
-        Method m = class_getInstanceMethod(cls, sels[i]);
-        if (m) {
-            SEL capturedSel = sels[i];
-            IMP orig = method_getImplementation(m);
-            IMP new = imp_implementationWithBlock(^(id self, NSURL *url, void *a2, void *a3, id a4, id a5) {
-                if (url && [url isKindOfClass:[NSURL class]]) {
-                    NSString *s = url.absoluteString;
-                    if (isGoodImageURL(s)) [g_collector addURL:s from:@"SDWebMgr"];
-                }
-                ((SDWebHookFn)orig)(self, capturedSel, url, a2, a3, a4, a5);
-            });
-            method_setImplementation(m, new);
-            HHLog(@"✅ Hook SDWebImageManager: %@", NSStringFromSelector(sels[i]));
-            return;
-        }
-    }
-    HHLog(@"⚠️ SDWebImageManager 未找到匹配方法，打印可用方法:");
-    unsigned int mc = 0;
-    Method *ms = class_copyMethodList(cls, &mc);
-    for (unsigned int i = 0; i < MIN(mc, 30); i++) {
-        HHLog(@"  - %@", NSStringFromSelector(method_getName(ms[i])));
-    }
-    free(ms);
+    return _origDataTaskWithReq(self, _cmd, req, wrapped);
 }
 
-// ---- Hook 2: NSURLSession dataTaskWithURL (兜底，拦截网络请求) ----
-static void hook_NSURLSession(void) {
-    Class cls = objc_getClass("NSURLSession");
-    // Hook实例方法 dataTaskWithURL:completionHandler:
-    SEL sel = @selector(dataTaskWithURL:completionHandler:);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (m) {
-        IMP orig = method_getImplementation(m);
-        IMP new = imp_implementationWithBlock(^(id self, NSURL *url, id handler) {
-            if (url && [url isKindOfClass:[NSURL class]]) {
-                NSString *s = url.absoluteString;
-                if (isGoodImageURL(s)) [g_collector addURL:s from:@"NSURLSession"];
-            }
-            return ((id(*)(id,SEL,NSURL*,id))orig)(self, sel, url, handler);
-        });
-        method_setImplementation(m, new);
-        HHLog(@"✅ Hook NSURLSession dataTaskWithURL:");
-    } else {
-        HHLog(@"⚠️ NSURLSession dataTaskWithURL: 不存在");
-    }
-}
+typedef NSURLSessionDataTask *(*DataTaskWithURLFn)(id, SEL, NSURL *, void(^)(NSData *, NSURLResponse *, NSError *));
+static DataTaskWithURLFn _origDataTaskWithURL = NULL;
 
-// ---- Hook 3: NSURLRequest (拦截所有创建) ----
-static void hook_NSURLRequest(void) {
-    Class cls = objc_getClass("NSURLRequest");
-    SEL sel = @selector(requestWithURL:);
-    Method m = class_getClassMethod(cls, sel);
-    if (m) {
-        IMP orig = method_getImplementation(m);
-        IMP new = imp_implementationWithBlock(^(id self, NSURL *url) {
-            if (url && [url isKindOfClass:[NSURL class]]) {
-                NSString *s = url.absoluteString;
-                if (isGoodImageURL(s)) [g_collector addURL:s from:@"NSURLReq"];
-            }
-            return ((id(*)(id,SEL,NSURL*))orig)(self, sel, url);
-        });
-        method_setImplementation(m, new);
-        HHLog(@"✅ Hook NSURLRequest requestWithURL:");
-    }
-}
-
-// ---- Hook 4: SDWebImageDownloader ----
-typedef void (*SDDownloadHookFn)(id, SEL, NSURL *, void *, void *, id, id);
-static void hook_SDWebImageDownloader(void) {
-    Class cls = objc_getClass("SDWebImageDownloader");
-    if (!cls) { HHLog(@"⚠️ SDWebImageDownloader 不存在"); return; }
-    
-    SEL sels[] = {
-        @selector(downloadImageWithURL:options:context:),
-        @selector(downloadImageWithURL:options:progress:completed:),
-        @selector(downloadImageWithURL:completed:),
+static NSURLSessionDataTask *_hookDataTaskWithURL(id self, SEL _cmd, NSURL *url, void(^handler)(NSData *, NSURLResponse *, NSError *)) {
+    id handlerCopy = [handler copy];
+    void(^wrapped)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *resp, NSError *err) {
+        NSInteger status = 0;
+        if ([resp isKindOfClass:[NSHTTPURLResponse class]]) status = ((NSHTTPURLResponse *)resp).statusCode;
+        NetEntry *e = [NetEntry new];
+        e.url = url.absoluteString; e.method = @"GET"; e.statusCode = status; e.bodySize = data.length;
+        e.preview = safePreview(data, 150);
+        [[NetPanel shared] addEntry:e];
+        if (handlerCopy) ((void(^)(NSData *, NSURLResponse *, NSError *))handlerCopy)(data, resp, err);
     };
-    
-    for (int i = 0; i < 3; i++) {
-        Method m = class_getInstanceMethod(cls, sels[i]);
-        if (m) {
-            SEL capturedSel = sels[i];
-            IMP orig = method_getImplementation(m);
-            IMP new = imp_implementationWithBlock(^(id self, NSURL *url, void *a2, void *a3, id a4, id a5) {
-                if (url && [url isKindOfClass:[NSURL class]]) {
-                    NSString *s = url.absoluteString;
-                    if (isGoodImageURL(s)) [g_collector addURL:s from:@"SDDownload"];
-                }
-                ((SDDownloadHookFn)orig)(self, capturedSel, url, a2, a3, a4, a5);
-            });
-            method_setImplementation(m, new);
-            HHLog(@"✅ Hook SDWebImageDownloader: %@", NSStringFromSelector(sels[i]));
-            return;
-        }
-    }
-    HHLog(@"⚠️ SDWebImageDownloader 无匹配方法");
-}
-
-// ---- Hook 5: UIImageView sd_setImageWithURL (最简单直接的) ----
-static void hook_UIImageView_sd(void) {
-    // 这个hook的是UIImageView分类里的方法，最直观
-    // sd_setImageWithURL: 
-    SEL sel = @selector(sd_setImageWithURL:);
-    Method m = class_getInstanceMethod([UIImageView class], sel);
-    if (m) {
-        IMP orig = method_getImplementation(m);
-        IMP new = imp_implementationWithBlock(^(UIImageView *self, NSURL *url) {
-            if (url && [url isKindOfClass:[NSURL class]]) {
-                NSString *s = url.absoluteString;
-                if (isGoodImageURL(s)) [g_collector addURL:s from:@"UIImageView"];
-            }
-            ((void(*)(id,SEL,NSURL*))orig)(self, sel, url);
-        });
-        method_setImplementation(m, new);
-        HHLog(@"✅ Hook UIImageView sd_setImageWithURL:");
-    } else {
-        // 试试旧版带placeholder的方法
-        SEL sel2 = @selector(sd_setImageWithURL:placeholderImage:);
-        m = class_getInstanceMethod([UIImageView class], sel2);
-        if (m) {
-            IMP orig = method_getImplementation(m);
-            IMP new = imp_implementationWithBlock(^(UIImageView *self, NSURL *url, UIImage *placeholder) {
-                if (url && [url isKindOfClass:[NSURL class]]) {
-                    NSString *s = url.absoluteString;
-                    if (isGoodImageURL(s)) [g_collector addURL:s from:@"UIImageView"];
-                }
-                ((void(*)(id,SEL,NSURL*,UIImage*))orig)(self, sel2, url, placeholder);
-            });
-            method_setImplementation(m, new);
-            HHLog(@"✅ Hook UIImageView sd_setImageWithURL:placeholderImage:");
-        } else {
-            HHLog(@"⚠️ UIImageView sd_setImageWithURL: 未找到(可能不用SD加载图片)");
-        }
-    }
-}
-
-// ---- Hook 6: GoodsImageModel (精准hook) ----
-static void hook_GoodsImageModel(void) {
-    Class cls = objc_getClass("GoodsImageModel");
-    if (!cls) { HHLog(@"⚠️ GoodsImageModel 类不存在"); return; }
-    HHLog(@"✅ GoodsImageModel 存在，打印属性:");
-    unsigned int pc = 0;
-    objc_property_t *ps = class_copyPropertyList(cls, &pc);
-    for (unsigned int i = 0; i < pc; i++) {
-        const char *n = property_getName(ps[i]);
-        const char *attrs = property_getAttributes(ps[i]);
-        HHLog(@"  属性%d: %s (%s)", i+1, n, attrs ? attrs : "?");
-    }
-    free(ps);
-    
-    // 尝试常见属性名: url, imageUrl, thumbUrl, image_url, imgUrl, picUrl
-    NSArray *candidates = @[@"url", @"imageUrl", @"thumbUrl", @"image_url", @"imgUrl", @"picUrl", @"pictureUrl", @"src"];
-    for (NSString *attr in candidates) {
-        NSString *setter = [NSString stringWithFormat:@"set%@%@:", 
-                           [[attr substringToIndex:1] uppercaseString],
-                           [attr substringFromIndex:1]];
-        SEL sel = NSSelectorFromString(setter);
-        if ([cls instancesRespondToSelector:sel]) {
-            Method m = class_getInstanceMethod(cls, sel);
-            IMP orig = method_getImplementation(m);
-            IMP new = imp_implementationWithBlock(^(id self, NSString *url){
-                ((void(*)(id,SEL,NSString*))orig)(self, sel, url);
-                if (isGoodImageURL(url)) [g_collector addURL:url from:@"GoodsImgModel"];
-            });
-            method_setImplementation(m, new);
-            HHLog(@"✅ Hook GoodsImageModel: %@", setter);
-            return;
-        }
-    }
-    HHLog(@"⚠️ GoodsImageModel 未找到任何图片URL setter (已打印属性列表，请查看)");
-}
-
-// ---- Hook 7: AMImageURLInfo ----
-static void hook_AMImageURLInfo(void) {
-    Class cls = objc_getClass("AMImageURLInfo");
-    if (!cls) { HHLog(@"⚠️ AMImageURLInfo 不存在"); return; }
-    HHLog(@"✅ AMImageURLInfo 存在，尝试hook url setter");
-    
-    for (NSString *a in @[@"url", @"imageUrl", @"thumbUrl", @"rawUrl", @"originUrl"]) {
-        NSString *s = [NSString stringWithFormat:@"set%@%@:", 
-                       [[a substringToIndex:1] uppercaseString], [a substringFromIndex:1]];
-        SEL sel = NSSelectorFromString(s);
-        if ([cls instancesRespondToSelector:sel]) {
-            Method m = class_getInstanceMethod(cls, sel);
-            IMP orig = method_getImplementation(m);
-            IMP new = imp_implementationWithBlock(^(id self, NSString *url){
-                ((void(*)(id,SEL,NSString*))orig)(self, sel, url);
-                if (isGoodImageURL(url)) [g_collector addURL:url from:@"AMImgInfo"];
-            });
-            method_setImplementation(m, new);
-            HHLog(@"✅ Hook AMImageURLInfo: %@", s);
-            return;
-        }
-    }
+    return _origDataTaskWithURL(self, _cmd, url, wrapped);
 }
 
 // ==================== 入口 ====================
 __attribute__((constructor))
 static void PDDSaverEntry(void) {
     @autoreleasepool {
-        HHLog(@"========================================");
-        HHLog(@"🚀 PDDSaver v2 已注入");
-        HHLog(@"   BundleID: %@", [NSBundle mainBundle].bundleIdentifier);
-        HHLog(@"   架构: %@", @(sizeof(void*))); // 8==arm64
-        HHLog(@"========================================");
-        
-        g_collector = [[ImgCollector alloc] init];
-        
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            @autoreleasepool {
-                HHLog(@"");
-                HHLog(@"🏗️ [诊断] 安装所有Hooks...");
-                
-                // 策略1: UIImageView sd_setImageWithURL (最简单直接)
-                HHLog(@"");
-                HHLog(@"--- 策略1: UIImageView.sd_setImageWithURL ---");
-                hook_UIImageView_sd();
-                
-                // 策略2: NSURLRequest (拦截所有网络请求图片)
-                HHLog(@"");
-                HHLog(@"--- 策略2: NSURLRequest ---");
-                hook_NSURLRequest();
-                
-                // 策略3: NSURLSession (兜底)
-                HHLog(@"");
-                HHLog(@"--- 策略3: NSURLSession ---");
-                hook_NSURLSession();
-                
-                // 策略4: SDWebImageDownloader
-                HHLog(@"");
-                HHLog(@"--- 策略4: SDWebImageDownloader ---");
-                hook_SDWebImageDownloader();
-                
-                // 策略5: SDWebImageManager
-                HHLog(@"");
-                HHLog(@"--- 策略5: SDWebImageManager ---");
-                hook_SDWebImageManager();
-                
-                // 策略6: GoodsImageModel (精准)
-                HHLog(@"");
-                HHLog(@"--- 策略6: GoodsImageModel ---");
-                hook_GoodsImageModel();
-                
-                // 策略7: AMImageURLInfo
-                HHLog(@"");
-                HHLog(@"--- 策略7: AMImageURLInfo ---");
-                hook_AMImageURLInfo();
-                
-                HHLog(@"");
-                HHLog(@"========================================");
-                HHLog(@"🏁 所有Hook安装完成");
-                HHLog(@"========================================");
-                
-                // 显示浮窗
-                [FloatBall showWithCollector:g_collector];
-            }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            SEL s1 = @selector(dataTaskWithRequest:completionHandler:);
+            Method m1 = class_getInstanceMethod([NSURLSession class], s1);
+            if (m1) { _origDataTaskWithReq = (DataTaskWithReqFn)method_getImplementation(m1); method_setImplementation(m1, (IMP)_hookDataTaskWithReq); }
+
+            SEL s2 = @selector(dataTaskWithURL:completionHandler:);
+            Method m2 = class_getInstanceMethod([NSURLSession class], s2);
+            if (m2) { _origDataTaskWithURL = (DataTaskWithURLFn)method_getImplementation(m2); method_setImplementation(m2, (IMP)_hookDataTaskWithURL); }
+
+            [[NetPanel shared] show];
+            [FloatBall show];
+            HHLog(@"📡 v4网络面板已启动 - 点右下浮球开关面板");
         });
     }
 }
