@@ -42,7 +42,7 @@ on:
 env:
   TWEAK_NAME: PDDSaver
   SRC_FILE: MyTweak_example/PDDSaver.m
-  FRAMEWORKS: "-framework Foundation -framework UIKit -framework QuartzCore"
+  FRAMEWORKS: "-framework Foundation -framework UIKit -framework QuartzCore -framework CoreGraphics"
 
 # ============================================================
 jobs:
